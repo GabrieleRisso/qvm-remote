@@ -190,29 +190,98 @@ The VM client requires no configuration beyond the key file.
 
 ## Web Admin Panel (new in v1.1)
 
-Air-gapped web admin for Qubes OS dom0. Zero external dependencies — pure
-Python stdlib HTTP server on `127.0.0.1:8901`.
+Air-gapped web admin for Qubes OS dom0. Zero external dependencies -- pure
+Python stdlib HTTP server on `127.0.0.1:9876`. No internet required.
+
+### Install
 
 ```bash
-# Start the web admin in dom0
-sudo make install-webui
-qubes-global-admin-web
-# Open http://127.0.0.1:8901 in dom0 browser
+# From dom0 (using upgrade script from a VM):
+bash upgrade-dom0.sh
+
+# Or manually:
+sudo make install-web
 ```
 
-**Features:**
-- Dashboard: daemon status, service control
-- Execute: run dom0 commands via qvm-remote
-- Virtual Machines: authorize/revoke keys, start/stop/pause VMs
-- Files: push/pull between dom0 and VMs
-- Backup: system + config backups
-- Log: daemon log viewer
-- This Device: system hardware info
-- OpenClaw: manage multi-agent AI containers across VMs
-- Global Config: Qubes OS global preferences
-- Advanced: firewall, devices, features, tags, services, policies
+### Enable and start
 
-All API calls are localhost-only. No internet connectivity required.
+```bash
+systemctl enable --now qvm-remote-dom0 qubes-global-admin-web qubes-admin-watchdog.timer
+```
+
+All three services survive reboots. The watchdog timer checks health every 60s
+and auto-restarts failed services.
+
+### Access
+
+```bash
+firefox http://127.0.0.1:9876
+```
+
+### XFCE genmon panel plugin
+
+Add a Generic Monitor plugin to the XFCE panel, then configure:
+
+- Command: `/usr/local/bin/qubes-admin-genmon.sh`
+- Period: `15` seconds
+
+The plugin shows a green/yellow/red dot for service health. Clicking opens the
+web UI or restarts services.
+
+### XFCE autostart
+
+The autostart desktop entry (`/etc/xdg/autostart/qubes-admin-autostart.desktop`)
+runs at XFCE login and configures workspaces, genmon, and opens Firefox.
+Services are started by systemd, not the autostart script.
+
+To skip the VM selector dialog at login:
+
+```bash
+QVM_REMOTE_SKIP_SELECTOR=1
+```
+
+### Features
+
+- **Dashboard**: daemon status, service control, self-heal diagnostics
+- **Execute**: run dom0 commands with streaming output
+- **VM Tools**: authorize/revoke keys, start/stop/pause VMs, run commands in VMs
+- **Files**: push/pull between dom0 and VMs
+- **Backup**: system + config backups
+- **Log**: daemon log viewer, VM logs, autostart logs
+- **This Device**: system hardware and Xen info
+- **OpenClaw**: manage multi-agent AI containers across VMs
+- **Global Config**: Qubes OS global preferences
+- **qvm-remote**: connection map, queue management, command history
+- **Policy enforcement**: restrict dom0 modifications, per-VM access levels,
+  blocked commands list (save-and-apply workflow, like Qubes Global Config)
+
+### Architecture
+
+```
+dom0
+├── qvm-remote-dom0.service       daemon (polls VMs for commands)
+├── qubes-global-admin-web.service  web UI on 127.0.0.1:9876
+├── qubes-admin-watchdog.timer     health check every 60s
+├── qubes-admin-genmon.sh          XFCE panel status indicator
+└── qubes-admin-autostart.sh       XFCE login setup
+```
+
+### E2E testing
+
+```bash
+# From dom0:
+bash /tmp/test-dom0-e2e.sh
+
+# Or from a VM (push + run):
+bash upgrade-dom0.sh   # ensures test is deployed
+qvm-remote 'bash /tmp/test-dom0-e2e.sh'
+```
+
+### RPM packaging
+
+```bash
+make docker-rpm   # builds qvm-remote-webui-dom0 RPM in container
+```
 
 ## GTK Admin Panel (new in v1.1)
 
@@ -387,10 +456,15 @@ qvm-remote/
 │   ├── qvm-remote-dom0              Dom0 daemon (Python)
 │   └── qvm-remote-dom0.service      Systemd unit
 ├── webui/
-│   ├── qubes-global-admin-web       Web admin panel (2649 lines, stdlib only)
+│   ├── qubes-global-admin-web          Web admin panel (stdlib only)
 │   ├── qubes-global-admin-web.service  Systemd unit
-│   ├── qubes-admin-autostart.sh     Autostart script
-│   └── devilspie2.lua               Window management rules
+│   ├── qubes-global-admin-web.desktop  Desktop entry
+│   ├── qubes-admin-watchdog.service    Health check oneshot
+│   ├── qubes-admin-watchdog.timer      60s health check timer
+│   ├── qubes-admin-genmon.sh           XFCE panel status plugin
+│   ├── qubes-admin-autostart.sh        XFCE login setup
+│   ├── qubes-admin-autostart.desktop   Autostart desktop entry
+│   └── devilspie2.lua                  Window management rules
 ├── gui2/
 │   ├── qubes-global-admin           GTK admin panel (978 lines)
 │   ├── qubes-global-admin-dom0      Dom0 admin daemon (542 lines)
@@ -402,14 +476,16 @@ qvm-remote/
 │   ├── qvm-remote-dom0-gui          Dom0 GUI (GTK3)
 │   └── *.desktop                    Desktop entries
 ├── install/
-│   └── install-dom0.sh              Dom0 shell installer
+│   ├── install-dom0.sh              Dom0 shell installer
+│   └── install-client-template.sh   Install client in template VMs
 ├── etc/
 │   └── qubes-remote.conf            Config template
 ├── rpm_spec/
 │   ├── qvm-remote-dom0.spec         Dom0 CLI RPM
 │   ├── qvm-remote-vm.spec           VM CLI RPM
 │   ├── qvm-remote-gui-dom0.spec     Dom0 GUI RPM
-│   └── qvm-remote-gui-vm.spec       VM GUI RPM
+│   ├── qvm-remote-gui-vm.spec       VM GUI RPM
+│   └── qvm-remote-webui-dom0.spec   Dom0 Web Admin RPM
 ├── pkg/
 │   ├── PKGBUILD                     Arch Linux CLI package
 │   └── PKGBUILD-gui                 Arch Linux GUI package
@@ -421,6 +497,7 @@ qvm-remote/
 │   ├── test_gui_wiring.py           GUI wiring tests
 │   ├── test_gui_integration.py      GUI integration tests
 │   ├── test_backup_e2e.py           Backup E2E tests
+│   ├── test-dom0-e2e.sh             Dom0 web admin E2E (24 tests)
 │   ├── dom0-sim/                    Mock dom0 environment
 │   └── Dockerfile.*                 Container test harnesses
 ├── .github/workflows/ci.yml         GitHub Actions CI

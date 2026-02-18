@@ -220,6 +220,15 @@ dist: clean
 	    > build/SPECS/qvm-remote-gui-dom0.spec
 	tar czf build/SOURCES/qvm-remote-gui-dom0-$(VERSION).tar.gz \
 	    -C build/stage qvm-remote-gui-dom0-$(VERSION)
+	# webui-dom0 tarball
+	mkdir -p build/stage/qvm-remote-webui-dom0-$(VERSION)
+	cp -a webui/ Makefile version \
+	    build/stage/qvm-remote-webui-dom0-$(VERSION)/
+	sed 's/@VERSION@/$(VERSION)/g' \
+	    rpm_spec/qvm-remote-webui-dom0.spec \
+	    > build/SPECS/qvm-remote-webui-dom0.spec
+	tar czf build/SOURCES/qvm-remote-webui-dom0-$(VERSION).tar.gz \
+	    -C build/stage qvm-remote-webui-dom0-$(VERSION)
 	rm -rf build/stage
 	@echo ""
 	@echo "Source tarballs ready:"
@@ -227,12 +236,13 @@ dist: clean
 	@echo "  build/SOURCES/$(TARBALL_VM)"
 	@echo "  build/SOURCES/qvm-remote-gui-$(VERSION).tar.gz"
 	@echo "  build/SOURCES/qvm-remote-gui-dom0-$(VERSION).tar.gz"
+	@echo "  build/SOURCES/qvm-remote-webui-dom0-$(VERSION).tar.gz"
 
 # ── RPM build ──────────────────────────────────────────────────────
 
 rpm: dist
 	mkdir -p build/RPMS build/SRPMS build/BUILD build/BUILDROOT
-	@for spec in qvm-remote-dom0 qvm-remote-vm qvm-remote-gui-vm qvm-remote-gui-dom0; do \
+	@for spec in qvm-remote-dom0 qvm-remote-vm qvm-remote-gui-vm qvm-remote-gui-dom0 qvm-remote-webui-dom0; do \
 	    rpmbuild --define "_topdir $(CURDIR)/build" \
 	             --define "_sourcedir $(CURDIR)/build/SOURCES" \
 	             --define "_specdir $(CURDIR)/build/SPECS" \

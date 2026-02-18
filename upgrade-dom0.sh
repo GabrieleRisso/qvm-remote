@@ -12,7 +12,7 @@
 # Run from the VM: bash upgrade-dom0.sh
 
 REPO="${QVM_REMOTE_REPO:-$(cd "$(dirname "$0")" && pwd)}"
-VM="${QVM_REMOTE_VM:-$(hostname 2>/dev/null || echo visyble)}"
+VM="${QVM_REMOTE_VM:-$(hostname -s 2>/dev/null || echo unknown)}"
 INSTALL_GUI=0
 
 usage() {
@@ -79,9 +79,14 @@ if [ $INSTALL_GUI -eq 1 ]; then
     TAR_FILES="$TAR_FILES gui/qvm-remote-dom0-gui gui/qubes_remote_ui.py gui/qvm-remote-dom0-gui.desktop"
 fi
 
-# Also include webui if present
+# Also include webui and supporting files if present
 if [ -f "$REPO/webui/qubes-global-admin-web" ]; then
     TAR_FILES="$TAR_FILES webui/qubes-global-admin-web webui/qubes-global-admin-web.service webui/qubes-global-admin-web.desktop"
+    for f in webui/qubes-admin-watchdog.service webui/qubes-admin-watchdog.timer \
+             webui/qubes-admin-genmon.sh webui/qubes-admin-autostart.sh \
+             webui/qubes-admin-autostart.desktop; do
+        [ -f "$REPO/$f" ] && TAR_FILES="$TAR_FILES $f"
+    done
 fi
 
 qvm-remote -t 60 "qvm-run --pass-io --no-gui $VM 'tar czf - -C $REPO $TAR_FILES' | tar xzf - -C /tmp/qvm-remote-upgrade/ && echo 'tar bundle received'"
@@ -140,7 +145,6 @@ if [ -f \$UP/webui/qubes-global-admin-web ]; then
     if [ -f \$UP/webui/qubes-global-admin-web.service ]; then
         cp \$UP/webui/qubes-global-admin-web.service /etc/systemd/system/qubes-global-admin-web.service
         chmod 644 /etc/systemd/system/qubes-global-admin-web.service
-        systemctl daemon-reload
         echo "  installed web UI service"
     fi
     if [ -f \$UP/webui/qubes-global-admin-web.desktop ]; then
@@ -149,6 +153,31 @@ if [ -f \$UP/webui/qubes-global-admin-web ]; then
         chmod 644 /usr/share/applications/qubes-global-admin-web.desktop
         echo "  installed web UI desktop file"
     fi
+    # Watchdog timer + service
+    for f in qubes-admin-watchdog.service qubes-admin-watchdog.timer; do
+        if [ -f \$UP/webui/\$f ]; then
+            cp \$UP/webui/\$f /etc/systemd/system/\$f
+            chmod 644 /etc/systemd/system/\$f
+            echo "  installed \$f"
+        fi
+    done
+    # Genmon and autostart scripts
+    mkdir -p /usr/local/bin
+    for f in qubes-admin-genmon.sh qubes-admin-autostart.sh; do
+        if [ -f \$UP/webui/\$f ]; then
+            cp \$UP/webui/\$f /usr/local/bin/\$f
+            chmod 755 /usr/local/bin/\$f
+            echo "  installed \$f"
+        fi
+    done
+    # Autostart desktop entry
+    if [ -f \$UP/webui/qubes-admin-autostart.desktop ]; then
+        mkdir -p /etc/xdg/autostart
+        cp \$UP/webui/qubes-admin-autostart.desktop /etc/xdg/autostart/qubes-admin-autostart.desktop
+        chmod 644 /etc/xdg/autostart/qubes-admin-autostart.desktop
+        echo "  installed autostart desktop entry"
+    fi
+    systemctl daemon-reload
 fi
 
 echo ""
@@ -161,15 +190,15 @@ echo ""
 echo "=== Files installed ==="
 INSTALL_SCRIPT
 
-# 5. Restart daemon
+# 5. Restart services
 echo ""
-echo "Restarting daemon..."
-qvm-remote -t 15 'systemctl start qvm-remote-dom0; sleep 2; echo "started"' 2>&1 || true
+echo "Restarting services..."
+qvm-remote -t 30 'systemctl restart qvm-remote-dom0 qubes-global-admin-web 2>&1; systemctl enable --now qubes-admin-watchdog.timer 2>&1; sleep 2; echo "services restarted"' 2>&1 || true
 sleep 3
 
 # 6. Verify
 echo ""
-echo "Verifying new daemon..."
+echo "Verifying..."
 if qvm-remote -t 10 ping 2>/dev/null; then
     echo "  PASS: daemon responding"
 else
@@ -177,6 +206,7 @@ else
 fi
 
 qvm-remote -t 10 'qvm-remote-dom0 --version' 2>&1
+qvm-remote -t 10 'systemctl is-active qvm-remote-dom0 qubes-global-admin-web qubes-admin-watchdog.timer 2>&1' || true
 
 echo ""
 echo "======================================"

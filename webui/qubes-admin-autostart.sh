@@ -50,11 +50,12 @@ fi
 
 # ── 3. Genmon panel plugin ──
 GENMON_CMD="/usr/local/bin/qubes-admin-genmon.sh"
+GENMON_PLUGIN="${QVM_REMOTE_GENMON_PLUGIN:-plugin-19}"
 if [ -f "$GENMON_CMD" ]; then
-    xfconf-query -c xfce4-panel -p /plugins/plugin-19/command -s "$GENMON_CMD" 2>/dev/null || true
-    xfconf-query -c xfce4-panel -p /plugins/plugin-19/update-period -s 15 2>/dev/null || true
-    xfconf-query -c xfce4-panel -p /plugins/plugin-19/use-label -s false 2>/dev/null || true
-    log "Genmon configured (15s)"
+    xfconf-query -c xfce4-panel -p "/plugins/${GENMON_PLUGIN}/command" -s "$GENMON_CMD" 2>/dev/null || true
+    xfconf-query -c xfce4-panel -p "/plugins/${GENMON_PLUGIN}/update-period" -s 15 2>/dev/null || true
+    xfconf-query -c xfce4-panel -p "/plugins/${GENMON_PLUGIN}/use-label" -s false 2>/dev/null || true
+    log "Genmon configured ($GENMON_PLUGIN, 15s)"
 fi
 
 # ── 4. Open Firefox ──

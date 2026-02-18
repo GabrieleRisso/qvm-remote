@@ -56,10 +56,10 @@ def _get_managed_vm():
             line = line.strip()
             if line.startswith("QVM_REMOTE_VMS="):
                 vms = line.split("=", 1)[1].strip().strip('"').strip("'")
-                return vms.split()[0] if vms else "visyble"
+                return vms.split()[0] if vms else "unknown"
     except OSError:
         pass
-    return "visyble"
+    return "unknown"
 
 MANAGED_VM = _get_managed_vm()
 POLICY_FILE = "/etc/qubes/remote-admin-policy.json"
@@ -570,6 +570,97 @@ def api_autostart_log(_params):
         return {"log": open("/tmp/dom0-admin-autostart.log").read()}
     except OSError:
         return {"log": "No autostart log found"}
+
+
+def api_journal(params):
+    """Read systemd journal for a specific unit."""
+    unit = params.get("unit", "qvm-remote-dom0")
+    lines = int(params.get("lines", 100))
+    since = params.get("since", "")
+    allowed = {
+        "qvm-remote-dom0", "qubes-global-admin-web",
+        "qubes-admin-watchdog", "qubesd",
+    }
+    if unit not in allowed:
+        return {"error": "Unit not allowed: " + unit}
+    cmd = ["journalctl", "-u", unit, "--no-pager", "-n", str(min(lines, 500))]
+    if since:
+        cmd.extend(["--since", since])
+    r = run(cmd, timeout=10)
+    return {"log": r["out"], "unit": unit, "rc": r["rc"]}
+
+
+def api_config_inspect(params):
+    """Read a dom0 config file (read-only, whitelisted paths)."""
+    path = params.get("path", "")
+    allowed = {
+        "/etc/qubes/remote.conf": "qvm-remote daemon config",
+        "/etc/qubes/remote-admin-policy.json": "Admin policy",
+        "/etc/qubes/openclaw.json": "OpenClaw config",
+        "/etc/systemd/system/qvm-remote-dom0.service": "Daemon service unit",
+        "/etc/systemd/system/qubes-global-admin-web.service": "Web UI service unit",
+        "/etc/systemd/system/qubes-admin-watchdog.service": "Watchdog service",
+        "/etc/systemd/system/qubes-admin-watchdog.timer": "Watchdog timer",
+    }
+    if not path:
+        return {"files": [{"path": k, "desc": v} for k, v in allowed.items()]}
+    if path not in allowed:
+        return {"error": "Path not allowed"}
+    try:
+        return {"path": path, "desc": allowed[path], "content": open(path).read()}
+    except OSError as e:
+        return {"path": path, "error": str(e)}
+
+
+def api_suggestions(params):
+    """Return smart suggestions for dropdowns and datalists."""
+    kind = params.get("kind", "")
+    vm = params.get("vm", "")
+    if kind == "vm-prefs":
+        return {"items": [
+            "autostart", "debug", "default_dispvm", "default_user",
+            "include_in_backups", "ip", "kernel", "kernelopts", "label",
+            "mac", "maxmem", "memory", "name", "netvm", "provides_network",
+            "qrexec_timeout", "template", "template_for_dispvms", "vcpus",
+            "virt_mode",
+        ]}
+    if kind == "global-prefs":
+        return {"items": [
+            "clockvm", "default_template", "default_fw_netvm",
+            "default_netvm", "default_kernel", "default_pool", "updatevm",
+        ]}
+    if kind == "features":
+        return {"items": [
+            "gui", "gui-default-allow-utf8-titles", "internal",
+            "os-distribution", "os-eol", "os-version",
+            "qrexec", "servicevm", "supported-service.qubes-update-check",
+            "updates-available",
+        ]}
+    if kind == "services":
+        return {"items": [
+            "crond", "cups", "meminfo-writer", "network-manager",
+            "qubes-firewall", "qubes-network", "qubes-update-check",
+            "qubes-updates-proxy",
+        ]}
+    if kind == "tags":
+        r = run(["qvm-tags", vm], timeout=5) if vm else {"out": "", "rc": 1}
+        common = ["audiovm-dom0", "created-by-dom0", "guivm-dom0",
+                   "anon-gateway", "anon-workstation", "whonix-updatevm"]
+        existing = [t.strip() for t in r["out"].splitlines() if t.strip()] if r.get("rc") == 0 else []
+        return {"items": sorted(set(common + existing))}
+    if kind == "containers" and vm:
+        eng = "podman" if run(["which", "podman"], timeout=3)["rc"] == 0 else "docker"
+        r = run("qvm-run --pass-io --no-gui {} '"
+                "eng=$(command -v podman || command -v docker); "
+                "$eng ps -a --format {{{{.Names}}}} 2>/dev/null'".format(vm),
+                timeout=10, shell=True)
+        names = [n.strip() for n in r["out"].splitlines() if n.strip()] if r.get("rc") == 0 else []
+        return {"items": names}
+    if kind == "policies":
+        r = run(["ls", "/etc/qubes/policy.d/"], timeout=5)
+        items = [f.strip() for f in r["out"].splitlines() if f.strip()] if r.get("rc") == 0 else []
+        return {"items": items}
+    return {"items": []}
 
 
 def api_qvm_ls(_params):
@@ -1225,6 +1316,9 @@ ROUTES = {
     "/api/panel-info": api_panel_info,
     "/api/health": api_health,
     "/api/self-heal": api_self_heal,
+    "/api/journal": api_journal,
+    "/api/config-inspect": api_config_inspect,
+    "/api/suggestions": api_suggestions,
 }
 
 
@@ -1583,6 +1677,25 @@ input:focus, textarea:focus { border-color: var(--blue); outline: none; }
   margin: 8px 0;
 }
 
+/* Log sub-tabs */
+.log-subtab {
+  background: none; border: none; padding: 8px 16px; cursor: pointer;
+  font-size: 13px; color: var(--soft); border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.log-subtab:hover { color: var(--text); background: #f0f0f0; }
+.log-subtab.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
+.log-panel { display: none; }
+.log-panel.active { display: block; }
+
+/* Log level coloring */
+.log-colored .log-err { color: #c0392b; font-weight: 600; }
+.log-colored .log-warn { color: #d68910; }
+.log-colored .log-info { color: #2c3e50; }
+.log-colored .log-debug { color: #7f8c8d; }
+.log-colored .log-ts { color: #7f8c8d; }
+.log-colored .log-highlight { background: #fff3cd; }
+
 /* Row layout */
 .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
 .row label { font-weight: 500; white-space: nowrap; min-width: 100px; }
@@ -1648,16 +1761,16 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
 <div class="main">
   <nav class="sidebar" id="sidebar">
     <button class="tab active" data-page="dashboard" title="Daemon status, service control, panel info">Dashboard</button>
-    <button class="tab" data-page="execute" title="Run commands in dom0 or inside VMs">Execute</button>
+    <button class="tab" data-page="log" title="Daemon, journal, VM, container, and autostart logs — always ready">Logs</button>
     <button class="tab" data-page="vms" title="Manage VMs: connect, authorize, lifecycle, templates">Virtual Machines</button>
+    <button class="tab" data-page="execute" title="Run commands in dom0 or inside VMs">Execute</button>
     <button class="tab" data-page="files" title="Transfer files between dom0 and VMs">Files</button>
-    <button class="tab" data-page="backup" title="System and config backups">Backup</button>
-    <button class="tab" data-page="log" title="View the qvm-remote-dom0 daemon log">Log</button>
-    <button class="tab" data-page="device" title="Dom0 hardware info and running VMs">This Device</button>
     <button class="tab" data-page="openclaw" title="OpenClaw multi-agent container management and config">OpenClaw</button>
+    <button class="tab" data-page="device" title="Dom0 hardware info and running VMs">This Device</button>
     <button class="tab" data-page="globalcfg" title="Qubes OS global preferences and settings">Global Config</button>
     <button class="tab" data-page="vmtools" title="Standard Qubes tools: firewall, devices, features, tags, services, policies">VM Tools</button>
     <button class="tab" data-page="qvmremote" title="qvm-remote connections, queue management, command history">qvm-remote</button>
+    <button class="tab" data-page="backup" title="System and config backups">Backup</button>
     <button class="tab" data-page="policy" title="Restrict command execution per VM pool &#8212; dom0 protection, selective permissions" style="border-top:1px solid var(--border)">Policy Enforcer</button>
   </nav>
 
@@ -1984,26 +2097,94 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
 
     <!-- ═══ Log ═══ -->
     <div class="page" id="page-log">
-      <h2 title="View the qvm-remote-dom0 daemon log, per-VM logs, and autostart log">Logs</h2>
-      <p class="expl">All logs in one place: daemon command log (per-VM filtering), container logs, and login autostart log.</p>
-
-      <h3 title="qvm-remote-dom0 daemon log — every command, exit code, duration">Daemon Log</h3>
-      <div class="card">
-        <div class="row">
-          <button onclick="loadLog()" title="Reload the full daemon log">All VMs</button>
-          <label style="min-width:auto" title="Filter log to a specific VM">VM filter:</label>
-          <select id="log-vm" class="vm-selector" style="width:140px;flex:none" title="Select a VM to show only its commands"><option value="">(all VMs)</option></select>
-          <button onclick="loadVmLog()" title="Show only commands from this VM">Filter</button>
-          <label style="min-width:auto">Lines:</label>
-          <input type="number" id="log-lines" value="100" style="width:80px;flex:none">
-        </div>
-        <div class="output" id="log-output" style="min-height:250px">Loading...</div>
+      <h2 title="View daemon logs, systemd journals, VM logs, container logs, and autostart logs">Logs</h2>
+      <div class="row" style="gap:0;margin-bottom:12px;border-bottom:2px solid var(--border)">
+        <button class="log-subtab active" data-logtab="daemon" onclick="switchLogTab('daemon')" title="qvm-remote-dom0 command log">Daemon</button>
+        <button class="log-subtab" data-logtab="journal" onclick="switchLogTab('journal')" title="Systemd journal for all services">Journal</button>
+        <button class="log-subtab" data-logtab="container" onclick="switchLogTab('container')" title="Container logs from VMs (podman/docker)">Containers</button>
+        <button class="log-subtab" data-logtab="autostart" onclick="switchLogTab('autostart')" title="Last login autostart script output">Autostart</button>
+        <button class="log-subtab" data-logtab="configs" onclick="switchLogTab('configs')" title="Inspect dom0 configuration files">Config Files</button>
+        <span style="flex:1"></span>
+        <label style="min-width:auto;font-size:11px;color:var(--soft)" title="Auto-refresh logs every 10 seconds"><input type="checkbox" id="log-autorefresh" onchange="toggleLogAutoRefresh()"> Auto-refresh</label>
       </div>
 
-      <h3 title="Log from the most recent login autostart script">Autostart Log</h3>
-      <div class="card">
-        <button onclick="loadAutoLog()" title="Show the last login setup log">Load</button>
-        <div class="output" id="autolog-output" style="max-height:200px">Click Load to view</div>
+      <!-- Daemon sub-tab -->
+      <div class="log-panel active" id="logpanel-daemon">
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn-primary" onclick="loadLog()" title="Reload the full daemon log">Refresh</button>
+          <label style="min-width:auto">VM:</label>
+          <select id="log-vm" class="vm-selector" style="width:140px;flex:none" title="Filter log to a specific VM"><option value="">(all VMs)</option></select>
+          <button onclick="loadVmLog()" title="Show only commands from this VM">Filter</button>
+          <label style="min-width:auto">Lines:</label>
+          <select id="log-lines" style="width:80px;flex:none"><option value="50">50</option><option value="100" selected>100</option><option value="200">200</option><option value="500">500</option></select>
+          <label style="min-width:auto">Search:</label>
+          <input type="text" id="log-search" placeholder="grep..." style="width:140px;flex:none" onkeydown="if(event.key==='Enter')filterLogOutput()">
+          <button onclick="filterLogOutput()" title="Filter current output by keyword">Go</button>
+        </div>
+        <div class="output log-colored" id="log-output" style="min-height:300px;max-height:600px">Loading...</div>
+      </div>
+
+      <!-- Journal sub-tab -->
+      <div class="log-panel" id="logpanel-journal">
+        <div class="row" style="margin-bottom:8px">
+          <label style="min-width:auto">Unit:</label>
+          <select id="journal-unit" style="width:200px;flex:none">
+            <option value="qvm-remote-dom0">qvm-remote-dom0</option>
+            <option value="qubes-global-admin-web">qubes-global-admin-web</option>
+            <option value="qubes-admin-watchdog">qubes-admin-watchdog</option>
+            <option value="qubesd">qubesd</option>
+          </select>
+          <label style="min-width:auto">Lines:</label>
+          <select id="journal-lines" style="width:80px;flex:none"><option value="50">50</option><option value="100" selected>100</option><option value="200">200</option><option value="500">500</option></select>
+          <label style="min-width:auto">Since:</label>
+          <select id="journal-since" style="width:120px;flex:none">
+            <option value="">(all)</option>
+            <option value="5 minutes ago">5 min</option>
+            <option value="1 hour ago" selected>1 hour</option>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+          </select>
+          <button class="btn-primary" onclick="loadJournal()" title="Fetch journal entries">Refresh</button>
+        </div>
+        <div class="output log-colored" id="journal-output" style="min-height:300px;max-height:600px">Select a unit and click Refresh</div>
+      </div>
+
+      <!-- Container sub-tab -->
+      <div class="log-panel" id="logpanel-container">
+        <div class="row" style="margin-bottom:8px">
+          <label style="min-width:auto">VM:</label>
+          <select id="clog-vm" class="vm-selector" style="width:140px;flex:none" title="VM running containers" onchange="loadContainerSuggestions()"><option value="">(select VM)</option></select>
+          <label style="min-width:auto">Container:</label>
+          <select id="clog-name-sel" style="width:180px;flex:none"><option value="">(select or type)</option></select>
+          <input type="text" id="clog-name" placeholder="or type name..." style="width:140px;flex:none" title="Container name">
+          <label style="min-width:auto">Lines:</label>
+          <select id="clog-lines" style="width:80px;flex:none"><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select>
+          <button class="btn-primary" onclick="getContainerLogs()" title="Fetch container logs">Refresh</button>
+        </div>
+        <div class="output log-colored" id="clog-output" style="min-height:300px;max-height:600px">Select a VM and container</div>
+      </div>
+
+      <!-- Autostart sub-tab -->
+      <div class="log-panel" id="logpanel-autostart">
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn-primary" onclick="loadAutoLog()" title="Load the last login autostart script output">Refresh</button>
+          <span style="font-size:11px;color:var(--soft)">From <code>/tmp/dom0-admin-autostart.log</code></span>
+        </div>
+        <div class="output log-colored" id="autolog-output" style="min-height:300px;max-height:600px">Loading...</div>
+      </div>
+
+      <!-- Config files sub-tab -->
+      <div class="log-panel" id="logpanel-configs">
+        <div class="row" style="margin-bottom:8px">
+          <label style="min-width:auto">File:</label>
+          <select id="config-file-sel" style="flex:1" onchange="loadConfigFile()">
+            <option value="">(select a config file)</option>
+          </select>
+          <button class="btn-primary" onclick="loadConfigFile()" title="Reload selected file">Refresh</button>
+          <button onclick="loadConfigFileList()" title="Refresh the file list">List Files</button>
+        </div>
+        <div style="font-size:11px;color:var(--soft);margin-bottom:6px" id="config-file-desc"></div>
+        <div class="output" id="config-file-output" style="min-height:300px;max-height:600px">Select a config file to inspect</div>
       </div>
     </div>
 
@@ -2164,7 +2345,7 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="card-title">Edit Preference</div>
         <div class="row">
           <label title="Preference name (e.g. default_netvm)">Property:</label>
-          <input type="text" id="gp-prop" placeholder="default_netvm" title="qubes-prefs property name">
+          <select id="gp-prop" title="qubes-prefs property name" style="width:180px"><option value="">(select property)</option><option value="clockvm">clockvm</option><option value="default_template">default_template</option><option value="default_fw_netvm">default_fw_netvm</option><option value="default_netvm">default_netvm</option><option value="default_kernel">default_kernel</option><option value="default_pool">default_pool</option><option value="updatevm">updatevm</option></select>
           <label title="New value" style="min-width:auto">Value:</label>
           <input type="text" id="gp-val" placeholder="sys-firewall" title="New value for the property">
           <button class="btn-primary" onclick="setGlobalPref()" title="Apply the preference change">Set</button>
@@ -2180,7 +2361,7 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         </div>
         <div class="row">
           <label title="Property to set">Prop:</label>
-          <input type="text" id="vp-prop" placeholder="memory" title="Property name (e.g. memory, vcpus, netvm)">
+          <select id="vp-prop" title="Property name (e.g. memory, vcpus, netvm)" style="width:180px"><option value="">(select property)</option><option>autostart</option><option>debug</option><option>default_dispvm</option><option>default_user</option><option>include_in_backups</option><option>ip</option><option>kernel</option><option>kernelopts</option><option>label</option><option>mac</option><option>maxmem</option><option>memory</option><option>netvm</option><option>provides_network</option><option>qrexec_timeout</option><option>template</option><option>template_for_dispvms</option><option>vcpus</option><option>virt_mode</option></select>
           <label style="min-width:auto">Value:</label>
           <input type="text" id="vp-val" placeholder="4096" title="New value">
           <button class="btn-primary" onclick="setVmPref()" title="Set the property value">Set</button>
@@ -2277,7 +2458,8 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <select id="feat-vm" class="vm-selector" style="width:180px" title="VM name"></select>
           <button onclick="loadFeatures()" title="List all features">List</button>
           <label style="min-width:auto">Feature:</label>
-          <input type="text" id="feat-name" placeholder="gui" title="Feature name">
+          <input type="text" id="feat-name" list="feat-name-dl" placeholder="gui" title="Feature name" style="width:160px">
+          <datalist id="feat-name-dl"><option value="gui"><option value="gui-default-allow-utf8-titles"><option value="internal"><option value="os-distribution"><option value="os-eol"><option value="os-version"><option value="qrexec"><option value="servicevm"><option value="supported-service.qubes-update-check"><option value="updates-available"></datalist>
           <label style="min-width:auto">Value:</label>
           <input type="text" id="feat-val" placeholder="1" title="Feature value">
           <button class="btn-primary" onclick="setFeature()" title="Set feature value">Set</button>
@@ -2292,7 +2474,8 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <select id="tag-vm" class="vm-selector" style="width:180px" title="VM name"></select>
           <button onclick="loadTags()" title="List tags">List</button>
           <label style="min-width:auto">Tag:</label>
-          <input type="text" id="tag-name" placeholder="my-tag" title="Tag name">
+          <input type="text" id="tag-name" list="tag-name-dl" placeholder="my-tag" title="Tag name" style="width:160px">
+          <datalist id="tag-name-dl"><option value="audiovm-dom0"><option value="created-by-dom0"><option value="guivm-dom0"><option value="anon-gateway"><option value="anon-workstation"><option value="whonix-updatevm"></datalist>
           <button class="btn-primary" onclick="modTag('add')" title="Add tag">Add</button>
           <button class="btn-danger" onclick="modTag('del')" title="Remove tag">Remove</button>
         </div>
@@ -2306,7 +2489,8 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <select id="svc-vm" class="vm-selector" style="width:180px" title="VM name"></select>
           <button onclick="loadServices()" title="List services">List</button>
           <label style="min-width:auto">Service:</label>
-          <input type="text" id="svc-name" placeholder="qubes-update-check" title="Service name">
+          <input type="text" id="svc-name" list="svc-name-dl" placeholder="qubes-update-check" title="Service name" style="width:180px">
+          <datalist id="svc-name-dl"><option value="crond"><option value="cups"><option value="meminfo-writer"><option value="network-manager"><option value="qubes-firewall"><option value="qubes-network"><option value="qubes-update-check"><option value="qubes-updates-proxy"></datalist>
           <button class="btn-primary" onclick="modService('enable')" title="Enable service">Enable</button>
           <button class="btn-danger" onclick="modService('disable')" title="Disable service">Disable</button>
           <button onclick="modService('default')" title="Reset to default">Default</button>
@@ -2329,7 +2513,7 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="row">
           <button onclick="loadPolicies()" title="List all policy files">List Policy Files</button>
           <label style="min-width:auto">File:</label>
-          <input type="text" id="pol-name" placeholder="50-openclaw.policy" title="Policy filename">
+          <select id="pol-name" title="Policy filename" style="width:220px"><option value="">(load list first)</option></select>
           <button onclick="readPolicy()" title="Read the policy file contents">Read</button>
         </div>
         <div class="output" id="pol-output" style="max-height:200px"></div>
@@ -2902,10 +3086,95 @@ async function startBackup() {
 }
 
 // ── Log ──
+let _logRawText = '';
+let _logAutoTimer = null;
+
+function colorizeLog(text, el) {
+  _logRawText = text;
+  el.innerHTML = '';
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const span = document.createElement('span');
+    span.textContent = line + '\n';
+    if (/\berr(or)?\b|FAIL|FATAL|panic|traceback/i.test(line)) span.className = 'log-err';
+    else if (/\bwarn(ing)?\b|WARN/i.test(line)) span.className = 'log-warn';
+    else if (/\bdebug\b|DEBUG/i.test(line)) span.className = 'log-debug';
+    else span.className = 'log-info';
+    el.appendChild(span);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+function filterLogOutput() {
+  const q = (document.getElementById('log-search') || {}).value || '';
+  const el = document.getElementById('log-output');
+  if (!q) { colorizeLog(_logRawText, el); return; }
+  const filtered = _logRawText.split('\n').filter(l => l.toLowerCase().includes(q.toLowerCase())).join('\n');
+  colorizeLog(filtered || '(no matches for "' + q + '")', el);
+}
+
+function switchLogTab(name) {
+  document.querySelectorAll('.log-subtab').forEach(t => t.classList.toggle('active', t.dataset.logtab === name));
+  document.querySelectorAll('.log-panel').forEach(p => p.classList.toggle('active', p.id === 'logpanel-' + name));
+  const loaders = {daemon: loadLog, journal: loadJournal, container: () => {}, autostart: loadAutoLog, configs: loadConfigFileList};
+  (loaders[name] || (() => {}))();
+}
+
+function toggleLogAutoRefresh() {
+  if (_logAutoTimer) { clearInterval(_logAutoTimer); _logAutoTimer = null; }
+  if (document.getElementById('log-autorefresh').checked) {
+    _logAutoTimer = setInterval(() => {
+      const active = document.querySelector('.log-subtab.active');
+      if (active) switchLogTab(active.dataset.logtab);
+    }, 10000);
+  }
+}
+
 async function loadLog() {
   const lines = document.getElementById('log-lines').value;
   const d = await api('/api/log', {lines});
-  document.getElementById('log-output').textContent = d.log || 'No log data';
+  colorizeLog(d.log || 'No log data', document.getElementById('log-output'));
+}
+
+async function loadJournal() {
+  const unit = document.getElementById('journal-unit').value;
+  const lines = document.getElementById('journal-lines').value;
+  const since = document.getElementById('journal-since').value;
+  const d = await api('/api/journal', {unit, lines, since});
+  colorizeLog(d.log || d.error || 'No journal entries', document.getElementById('journal-output'));
+}
+
+async function loadContainerSuggestions() {
+  const vm = document.getElementById('clog-vm').value.trim();
+  const sel = document.getElementById('clog-name-sel');
+  sel.innerHTML = '<option value="">(loading...)</option>';
+  if (!vm) { sel.innerHTML = '<option value="">(select VM first)</option>'; return; }
+  const d = await api('/api/suggestions', {kind: 'containers', vm});
+  sel.innerHTML = '<option value="">(select container)</option>';
+  for (const n of (d.items || [])) {
+    const o = document.createElement('option'); o.value = n; o.textContent = n;
+    sel.appendChild(o);
+  }
+}
+
+async function loadConfigFileList() {
+  const d = await api('/api/config-inspect');
+  const sel = document.getElementById('config-file-sel');
+  sel.innerHTML = '<option value="">(select a config file)</option>';
+  for (const f of (d.files || [])) {
+    const o = document.createElement('option'); o.value = f.path; o.textContent = f.path + ' — ' + f.desc;
+    sel.appendChild(o);
+  }
+}
+
+async function loadConfigFile() {
+  const path = document.getElementById('config-file-sel').value;
+  if (!path) return;
+  const d = await api('/api/config-inspect', {path});
+  document.getElementById('config-file-desc').textContent = d.desc || '';
+  const el = document.getElementById('config-file-output');
+  if (d.error) { el.textContent = 'Error: ' + d.error; return; }
+  el.textContent = d.content || '(empty file)';
 }
 
 // ── Device ──
@@ -3065,6 +3334,15 @@ async function modService(action) {
 async function loadPolicies() {
   const d = await api('/api/policy', {action: 'list'});
   document.getElementById('pol-output').textContent = d.out || 'No policies found';
+  const sel = document.getElementById('pol-name');
+  if (sel && d.out) {
+    sel.innerHTML = '<option value="">(select policy)</option>';
+    const files = d.out.trim().split('\n').filter(f => f.trim());
+    for (const f of files) {
+      const o = document.createElement('option'); o.value = f.trim(); o.textContent = f.trim();
+      sel.appendChild(o);
+    }
+  }
 }
 
 async function readPolicy() {
@@ -3084,12 +3362,14 @@ async function ocVmCtl(action) {
 }
 
 async function getContainerLogs() {
-  const container = document.getElementById('clog-name').value.trim();
+  const selVal = (document.getElementById('clog-name-sel') || {}).value || '';
+  const txtVal = (document.getElementById('clog-name') || {}).value.trim();
+  const container = selVal || txtVal;
   const vm = document.getElementById('clog-vm').value.trim();
   const lines = document.getElementById('clog-lines').value;
-  if (!container) return alert('Enter container name');
+  if (!container) return alert('Select or enter a container name');
   const d = await api('/api/container/logs', {container, vm, lines}, 'POST');
-  document.getElementById('clog-output').textContent = (d.out||'') + (d.err||d.error||'');
+  colorizeLog((d.out||'') + (d.err||d.error||''), document.getElementById('clog-output'));
 }
 
 // ── Per-VM log ──
@@ -3097,12 +3377,12 @@ async function loadVmLog() {
   const vm = document.getElementById('log-vm').value.trim();
   const lines = document.getElementById('log-lines').value;
   const d = await api('/api/vm-log', {vm, lines});
-  document.getElementById('log-output').textContent = d.log || 'No entries for this VM';
+  colorizeLog(d.log || 'No entries for this VM', document.getElementById('log-output'));
 }
 
 async function loadAutoLog() {
   const d = await api('/api/autostart-log');
-  document.getElementById('autolog-output').textContent = d.log || 'No autostart log found';
+  colorizeLog(d.log || 'No autostart log found', document.getElementById('autolog-output'));
 }
 
 // ── Policy Enforcer ──
@@ -3384,16 +3664,16 @@ async function loadCmdHistory() {
 // ── Tab loader map update ──
 const tabLoaders = {
   dashboard: () => { loadDashboard(); loadPanelInfo(); },
-  execute: () => {},
+  log: () => { const a = document.querySelector('.log-subtab.active'); switchLogTab(a ? a.dataset.logtab : 'daemon'); },
   vms: loadVmKeys,
+  execute: () => {},
   files: () => {},
-  backup: () => {},
-  log: loadLog,
-  device: loadDevice,
   openclaw: () => { loadOpenClaw(); loadOcConfig(); },
+  device: loadDevice,
   globalcfg: loadGlobalPrefs,
-  vmtools: () => {},
+  vmtools: () => { loadPolicies(); },
   qvmremote: () => { loadConnMap(); loadQrQueue(); },
+  backup: () => {},
   policy: loadAdminPolicy,
 };
 
