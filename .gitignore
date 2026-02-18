@@ -15,6 +15,12 @@ __pycache__/
 *~
 .DS_Store
 
+# LaTeX build artifacts
+paper/*.aux
+paper/*.out
+paper/*.log
+paper/*.synctex.gz
+
 # Cursor IDE
 .cursor/
 

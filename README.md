@@ -376,9 +376,12 @@ qvm-remote/
 ├── install/
 │   └── install-dom0.sh                Dom0 shell installer
 ├── paper/
-│   ├── qvm-remote.tex                 LaTeX source (TikZ diagrams)
-│   ├── qvm-remote.pdf                 Compiled paper (7 pages)
-│   └── posts.md                       X/LinkedIn/blog post content
+│   ├── qvm-remote.tex                 LaTeX source (6 TikZ diagrams, 40+ refs)
+│   ├── qvm-remote.pdf                 Compiled paper (~8 pages)
+│   ├── posts.md                       X/LinkedIn/Dev.to/HN/Reddit content
+│   ├── blog-qvm-remote.md            Website-ready blog post
+│   ├── MANIFEST.md                    Publication asset inventory
+│   └── Makefile                       Build: make all (PDF + PNGs + sync)
 ├── rpm_spec/                          RPM specs (dom0, vm, gui, webui)
 ├── pkg/                               Arch Linux PKGBUILD
 ├── debian/                            Debian packaging
@@ -393,9 +396,23 @@ qvm-remote/
 └── README.md                          This file
 ```
 
+## Publications
+
+The `paper/` directory contains a full academic paper and all associated marketing content. Run `make all` inside `paper/` to rebuild everything and sync to `~/Documents/qvm-remote/`.
+
+| Asset | File | Description |
+|-------|------|-------------|
+| Paper (PDF) | [`paper/qvm-remote.pdf`](paper/qvm-remote.pdf) | ~8 pages, 40+ references (2025 included) |
+| Blog post | [`paper/blog-qvm-remote.md`](paper/blog-qvm-remote.md) | Website-ready with frontmatter |
+| Social content | [`paper/posts.md`](paper/posts.md) | X, LinkedIn, Dev.to, HN, Reddit |
+| Architecture diagram | [`demo/architecture.png`](demo/architecture.png) | 1200x675, light academic palette |
+| Security diagram | [`demo/security.png`](demo/security.png) | Five-layer defense visualization |
+| Auth flow diagram | [`demo/auth-flow.png`](demo/auth-flow.png) | HMAC-SHA256 flow visualization |
+| Queue states | [`demo/queue-states.png`](demo/queue-states.png) | Command lifecycle state machine |
+| Build guide | [`paper/MANIFEST.md`](paper/MANIFEST.md) | Complete asset inventory + deps |
+
 ## Links
 
-- **Paper (PDF):** [`paper/qvm-remote.pdf`](paper/qvm-remote.pdf)
 - **qubes-claw** (AI agent infrastructure built on qvm-remote): [github.com/GabrieleRisso/qubes-claw](https://github.com/GabrieleRisso/qubes-claw)
 - **Qubes OS:** [qubes-os.org](https://www.qubes-os.org/)
 
