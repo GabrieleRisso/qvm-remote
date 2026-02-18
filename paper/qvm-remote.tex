@@ -33,36 +33,41 @@
 \newtheorem{lemma}{Lemma}
 \newtheorem{property}{Property}
 
-% ─── Color Palette (Tokyo Night) ─────────────────────────────────
-\definecolor{bg}{HTML}{1A1B26}
-\definecolor{fg}{HTML}{C0CAF5}
-\definecolor{blue1}{HTML}{7AA2F7}
-\definecolor{blue2}{HTML}{2AC3DE}
-\definecolor{green1}{HTML}{9ECE6A}
-\definecolor{orange1}{HTML}{FF9E64}
-\definecolor{purple1}{HTML}{BB9AF7}
-\definecolor{red1}{HTML}{F7768E}
-\definecolor{yellow1}{HTML}{E0AF68}
-\definecolor{teal1}{HTML}{73DACA}
-\definecolor{cyan1}{HTML}{7DCFFF}
-\definecolor{gray1}{HTML}{565F89}
-\definecolor{gray2}{HTML}{414868}
+% ─── Academic Color Palette ───────────────────────────────────────
+\definecolor{bg}{HTML}{F5F5F0}
+\definecolor{fg}{HTML}{2D2D2D}
+\definecolor{blue1}{HTML}{2563EB}
+\definecolor{blue2}{HTML}{0891B2}
+\definecolor{green1}{HTML}{16A34A}
+\definecolor{orange1}{HTML}{D97706}
+\definecolor{purple1}{HTML}{7C3AED}
+\definecolor{red1}{HTML}{DC2626}
+\definecolor{yellow1}{HTML}{CA8A04}
+\definecolor{teal1}{HTML}{0D9488}
+\definecolor{cyan1}{HTML}{0284C7}
+\definecolor{gray1}{HTML}{6B7280}
+\definecolor{gray2}{HTML}{D1D5DB}
+\definecolor{codebg}{HTML}{F0F0EC}
+\definecolor{codefg}{HTML}{374151}
+\definecolor{codekw}{HTML}{1D4ED8}
+\definecolor{codestr}{HTML}{059669}
+\definecolor{codecmt}{HTML}{9CA3AF}
 
 % ─── Listings ─────────────────────────────────────────────────────
 \lstdefinestyle{code}{
-    backgroundcolor=\color{bg},
-    basicstyle=\ttfamily\fontsize{7}{8.5}\selectfont\color{fg},
-    keywordstyle=\color{blue1}\bfseries,
-    stringstyle=\color{green1},
-    commentstyle=\color{gray1}\itshape,
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\fontsize{6.5}{8}\selectfont\color{codefg},
+    keywordstyle=\color{codekw}\bfseries,
+    stringstyle=\color{codestr},
+    commentstyle=\color{codecmt}\itshape,
     frame=single,
     rulecolor=\color{gray2},
     breaklines=true,
     columns=fullflexible,
     xleftmargin=3pt,
     xrightmargin=3pt,
-    aboveskip=6pt,
-    belowskip=6pt,
+    aboveskip=5pt,
+    belowskip=5pt,
 }
 
 % ─── Hyperref ─────────────────────────────────────────────────────
@@ -498,6 +503,44 @@ as a side effect of polling---preventing a compromised configuration
 from triggering VM launches.
 \end{property}
 
+% ─── Queue State Machine ─────────────────────────────────────────
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    state/.style={draw, rounded corners=5pt, thick,
+                  minimum width=1.7cm, minimum height=0.6cm,
+                  font=\sffamily\fontsize{7}{8}\selectfont,
+                  inner sep=3pt},
+    trans/.style={->, thick, >=Stealth, font=\sffamily\fontsize{5.5}{6.5}\selectfont},
+]
+\node[state, fill=blue1!12, draw=blue1!50, text=blue1!85]
+    (idle) at (0,0) {idle};
+\node[state, fill=teal1!12, draw=teal1!50, text=teal1!85]
+    (pend) at (2.5,0) {pending};
+\node[state, fill=orange1!12, draw=orange1!50, text=orange1!85]
+    (auth) at (5,0) {auth};
+\node[state, fill=yellow1!12, draw=yellow1!50, text=yellow1!85]
+    (run) at (2.5,-1.5) {running};
+\node[state, fill=green1!12, draw=green1!50, text=green1!85]
+    (done) at (5,-1.5) {results};
+\node[state, fill=red1!12, draw=red1!50, text=red1!85]
+    (rej) at (0,-1.5) {rejected};
+
+\draw[trans, blue1!70] (idle) -- node[above] {enqueue} (pend);
+\draw[trans, teal1!70] (pend) -- node[above] {poll} (auth);
+\draw[trans, red1!60] (auth) -- node[left, align=center] {HMAC\\fail} (rej);
+\draw[trans, orange1!70] (auth) -- node[right, align=center] {HMAC\\ok} (run);
+\draw[trans, green1!70] (run) -- node[above] {complete} (done);
+\draw[trans, gray1, dashed] (done) -- node[below, color=gray1] {archive} ++(1.5,0);
+\draw[trans, gray1, dashed] (rej) -- node[below, color=gray1] {log} ++(-1.2,0);
+\end{tikzpicture}
+\caption{\textbf{Command queue state machine.} Each command transitions
+through six states. Failed authentication results in immediate rejection
+and logging; successful commands are archived to the history directory.}
+\label{fig:statemachine}
+\end{figure}
+
 % ─── 4. Authentication ───────────────────────────────────────────
 \section{Authentication Analysis}
 \label{sec:auth}
@@ -518,6 +561,69 @@ Key exchange is performed out-of-band by the administrator, who
 generates the key in the VM and registers it in dom0 through a
 separate authenticated session. The key itself never traverses the
 queue protocol.
+
+% ─── HMAC Flow Diagram ───────────────────────────────────────────
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    box/.style={draw, rounded corners=3pt, thick,
+                minimum width=1.5cm, minimum height=0.5cm,
+                font=\sffamily\fontsize{6.5}{7.5}\selectfont,
+                inner sep=3pt},
+    arr/.style={->, thick, >=Stealth},
+    lbl/.style={font=\sffamily\fontsize{5.5}{6.5}\selectfont},
+]
+% VM side
+\node[font=\sffamily\bfseries\fontsize{7}{8}\selectfont, color=orange1!85]
+    (vml) at (0,2.2) {VM};
+\node[box, fill=purple1!10, draw=purple1!45, text=purple1!80]
+    (key1) at (0,1.5) {$k$ (auth.key)};
+\node[box, fill=orange1!10, draw=orange1!45, text=orange1!80]
+    (cid1) at (0,0.7) {cid};
+\node[box, fill=teal1!10, draw=teal1!45, text=teal1!80]
+    (hmac1) at (0,0) {HMAC-SHA256};
+\node[box, fill=green1!10, draw=green1!45, text=green1!80]
+    (tok1) at (0,-0.8) {$\tau$};
+
+\draw[arr, purple1!60] (key1) -- (hmac1);
+\draw[arr, orange1!60] (cid1) -- (hmac1);
+\draw[arr, teal1!60] (hmac1) -- (tok1);
+
+% dom0 side
+\node[font=\sffamily\bfseries\fontsize{7}{8}\selectfont, color=blue1!85]
+    (d0l) at (4.5,2.2) {dom0};
+\node[box, fill=purple1!10, draw=purple1!45, text=purple1!80]
+    (key2) at (4.5,1.5) {$k$ (vm.key)};
+\node[box, fill=orange1!10, draw=orange1!45, text=orange1!80]
+    (cid2) at (4.5,0.7) {cid};
+\node[box, fill=teal1!10, draw=teal1!45, text=teal1!80]
+    (hmac2) at (4.5,0) {HMAC-SHA256};
+\node[box, fill=blue1!10, draw=blue1!45, text=blue1!80]
+    (tok2) at (4.5,-0.8) {$\tau'$};
+
+\draw[arr, purple1!60] (key2) -- (hmac2);
+\draw[arr, orange1!60] (cid2) -- (hmac2);
+\draw[arr, teal1!60] (hmac2) -- (tok2);
+
+% Transfer and compare
+\draw[arr, gray1, dashed] (tok1.east) -- node[above, lbl, color=gray1]
+    {queue file} (tok2.west);
+
+\node[box, fill=green1!12, draw=green1!50, text=green1!80,
+      minimum width=2.2cm] (cmp) at (2.25,-1.8)
+    {compare\_digest($\tau$,$\tau'$)};
+\draw[arr, green1!60] (tok1.south) |- (cmp.west);
+\draw[arr, blue1!60] (tok2.south) |- (cmp.east);
+
+\node[lbl, color=green1!70, below=0.12cm of cmp] {constant-time};
+\end{tikzpicture}
+\caption{\textbf{HMAC-SHA256 authentication flow.} Both sides independently
+compute the token from their copy of the shared key. Only $\tau$ traverses
+the queue; the key $k$ never leaves its storage. Verification uses
+constant-time comparison.}
+\label{fig:hmacflow}
+\end{figure}
 
 \subsection{Per-Command Authentication}
 
@@ -788,6 +894,54 @@ The daemon polls at a 1-second interval. For interactive use, the
 average 500\,ms discovery latency is imperceptible compared to
 command execution time. For batch automation, commands can be
 pre-queued and processed sequentially within a single poll cycle.
+
+% ─── Latency Breakdown Diagram ───────────────────────────────────
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    >=Stealth,
+    phase/.style={draw, thick, minimum height=0.45cm,
+                  font=\sffamily\fontsize{5.5}{6.5}\selectfont,
+                  inner xsep=2pt, inner ysep=2pt},
+    lbl/.style={font=\sffamily\fontsize{5}{6}\selectfont, color=gray1},
+]
+% Timeline axis
+\draw[->, thick, gray1] (0,0) -- (7.5,0)
+    node[right, lbl] {time (ms)};
+
+% Phase bars (stacked horizontally)
+\node[phase, fill=orange1!15, draw=orange1!45, text=orange1!80,
+      minimum width=0.5cm, anchor=west] (w) at (0,0.4) {write};
+\node[phase, fill=blue1!12, draw=blue1!40, text=blue1!75,
+      minimum width=2.5cm, anchor=west] (poll) at (0.55,0.4) {poll wait};
+\node[phase, fill=purple1!12, draw=purple1!40, text=purple1!75,
+      minimum width=0.4cm, anchor=west] (hmac) at (3.1,0.4) {auth};
+\node[phase, fill=teal1!12, draw=teal1!40, text=teal1!75,
+      minimum width=0.3cm, anchor=west] (io) at (3.55,0.4) {I/O};
+\node[phase, fill=red1!10, draw=red1!35, text=red1!70,
+      minimum width=2.5cm, anchor=west] (exec) at (3.9,0.4) {exec};
+\node[phase, fill=green1!12, draw=green1!40, text=green1!75,
+      minimum width=0.5cm, anchor=west] (ret) at (6.45,0.4) {return};
+
+% Time labels
+\node[lbl] at (0.25,-0.25) {2};
+\node[lbl] at (1.8,-0.25) {$\sim$500};
+\node[lbl] at (3.3,-0.25) {3};
+\node[lbl] at (3.7,-0.25) {2};
+\node[lbl] at (5.1,-0.25) {cmd};
+\node[lbl] at (6.7,-0.25) {4};
+
+% Brace for overhead
+\draw[decorate, decoration={brace, amplitude=4pt, mirror},
+      thick, orange1!60] (0,-0.5) -- (3.85,-0.5)
+    node[midway, below=5pt, font=\sffamily\fontsize{5.5}{6.5}\selectfont,
+         color=orange1!80] {framework overhead $\sim$48\,ms};
+\end{tikzpicture}
+\caption{\textbf{Latency breakdown.} The poll wait ($\sim$500\,ms average)
+dominates discovery time. HMAC verification and file I/O add $\sim$5\,ms.
+Command execution time varies by workload.}
+\label{fig:latency}
+\end{figure}
 
 \subsection{Comparison with Alternatives}
 

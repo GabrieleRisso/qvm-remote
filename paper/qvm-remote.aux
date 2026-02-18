@@ -45,12 +45,13 @@
 \citation{python2024hmac}
 \citation{brumley2005remote}
 \citation{bellare2006new}
-\citation{bernstein2012security}
 \@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {Protocol architecture.} \textbf  {(1)}~VM writes command + HMAC to \texttt  {pending/}. \textbf  {(2)}~dom0 polls via \texttt  {qvm-run --pass-io}. \textbf  {(3)}~Verifies HMAC against stored key. \textbf  {(4)}~Executes in sandboxed work directory. \textbf  {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model); the VM never contacts dom0.}}{3}{figure.caption.1}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
 \newlabel{fig:protocol}{{1}{3}{\textbf {Protocol architecture.} \textbf {(1)}~VM writes command + HMAC to \texttt {pending/}. \textbf {(2)}~dom0 polls via \texttt {qvm-run --pass-io}. \textbf {(3)}~Verifies HMAC against stored key. \textbf {(4)}~Executes in sandboxed work directory. \textbf {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model); the VM never contacts dom0}{figure.caption.1}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Command identifier structure. The cryptographic random suffix ensures uniqueness even under concurrent execution.}}{3}{figure.caption.2}\protected@file@percent }
 \newlabel{fig:cmdid}{{2}{3}{Command identifier structure. The cryptographic random suffix ensures uniqueness even under concurrent execution}{figure.caption.2}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {Command queue state machine.} Each command transitions through six states. Failed authentication results in immediate rejection and logging; successful commands are archived to the history directory.}}{3}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:statemachine}{{3}{3}{\textbf {Command queue state machine.} Each command transitions through six states. Failed authentication results in immediate rejection and logging; successful commands are archived to the history directory}{figure.caption.3}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {4}Authentication Analysis}{3}{section.4}\protected@file@percent }
 \newlabel{sec:auth}{{4}{3}{Authentication Analysis}{section.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Key Model}{3}{subsection.4.1}\protected@file@percent }
@@ -59,8 +60,7 @@
 \newlabel{eq:verify}{{2}{3}{Per-Command Authentication}{equation.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Security Properties}{3}{subsection.4.3}\protected@file@percent }
 \newlabel{lem:forgery}{{1}{3}{Forgery Resistance}{lemma.1}{}}
-\newlabel{lem:replay}{{2}{3}{Replay Prevention}{lemma.2}{}}
-\newlabel{thm:crossvm}{{1}{3}{Cross-VM Isolation}{theorem.1}{}}
+\citation{bernstein2012security}
 \citation{nist800-53}
 \citation{bishop2003computer}
 \citation{crosby2003denial}
@@ -69,21 +69,42 @@
 \citation{poettering2010systemd}
 \citation{oliner2012advances}
 \citation{saltzer1975protection}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces \textbf  {HMAC-SHA256 authentication flow.} Both sides independently compute the token from their copy of the shared key. Only $\tau $ traverses the queue; the key $k$ never leaves its storage. Verification uses constant-time comparison.}}{4}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:hmacflow}{{4}{4}{\textbf {HMAC-SHA256 authentication flow.} Both sides independently compute the token from their copy of the shared key. Only $\tau $ traverses the queue; the key $k$ never leaves its storage. Verification uses constant-time comparison}{figure.caption.4}{}}
+\newlabel{lem:replay}{{2}{4}{Replay Prevention}{lemma.2}{}}
+\newlabel{thm:crossvm}{{1}{4}{Cross-VM Isolation}{theorem.1}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Brute-Force Analysis}{4}{subsection.4.4}\protected@file@percent }
 \newlabel{eq:bruteforce}{{3}{4}{Brute-Force Analysis}{equation.3}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {5}Defense-in-Depth Security Model}{4}{section.5}\protected@file@percent }
 \newlabel{sec:security}{{5}{4}{Defense-in-Depth Security Model}{section.5}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {Five-layer defense-in-depth model.} Each layer provides containment independent of the others.}}{4}{figure.caption.3}\protected@file@percent }
-\newlabel{fig:security}{{3}{4}{\textbf {Five-layer defense-in-depth model.} Each layer provides containment independent of the others}{figure.caption.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.1}L1: Cryptographic Authentication}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces \textbf  {Five-layer defense-in-depth model.} Each layer provides containment independent of the others.}}{4}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:security}{{5}{4}{\textbf {Five-layer defense-in-depth model.} Each layer provides containment independent of the others}{figure.caption.5}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.2}L2: Input Validation}{4}{subsection.5.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.3}L3: Execution Sandboxing}{4}{subsection.5.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.4}L4: Dual-Sided Audit Trail}{4}{subsection.5.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}L5: Transient-by-Default Operation}{4}{subsection.5.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Threat Model}{4}{subsection.5.6}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Attack surface and containment mapping.}}{4}{table.caption.4}\protected@file@percent }
-\newlabel{tab:threats}{{1}{4}{Attack surface and containment mapping}{table.caption.4}{}}
 \citation{qubes2024builder}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}L5: Transient-by-Default Operation}{5}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Threat Model}{5}{subsection.5.6}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Attack surface and containment mapping.}}{5}{table.caption.6}\protected@file@percent }
+\newlabel{tab:threats}{{1}{5}{Attack surface and containment mapping}{table.caption.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{5}{section.6}\protected@file@percent }
+\newlabel{sec:impl}{{6}{5}{Implementation}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Design Constraints}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Component sizes (pure Python, stdlib only).}}{5}{table.caption.7}\protected@file@percent }
+\newlabel{tab:components}{{2}{5}{Component sizes (pure Python, stdlib only)}{table.caption.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Packaging and Distribution}{5}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{5}{section.7}\protected@file@percent }
+\newlabel{sec:eval}{{7}{5}{Evaluation}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}End-to-End Latency}{5}{subsection.7.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces End-to-end command latency (median of 50 runs).}}{5}{table.caption.8}\protected@file@percent }
+\newlabel{tab:latency}{{3}{5}{End-to-end command latency (median of 50 runs)}{table.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Polling Efficiency}{5}{subsection.7.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces \textbf  {Latency breakdown.} The poll wait ($\sim $500\,ms average) dominates discovery time. HMAC verification and file I/O add $\sim $5\,ms. Command execution time varies by workload.}}{5}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:latency}{{6}{5}{\textbf {Latency breakdown.} The poll wait ($\sim $500\,ms average) dominates discovery time. HMAC verification and file I/O add $\sim $5\,ms. Command execution time varies by workload}{figure.caption.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Comparison with Alternatives}{5}{subsection.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Applications}{5}{section.8}\protected@file@percent }
+\newlabel{sec:applications}{{8}{5}{Applications}{section.8}{}}
 \citation{provos2003preventing}
 \citation{watson2010capsicum}
 \citation{rutkowska2010qubes}
@@ -91,25 +112,6 @@
 \citation{qubes2024u2f}
 \citation{neuman2005kerberos}
 \citation{spiffe2024}
-\@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{5}{section.6}\protected@file@percent }
-\newlabel{sec:impl}{{6}{5}{Implementation}{section.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Design Constraints}{5}{subsection.6.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Component sizes (pure Python, stdlib only).}}{5}{table.caption.5}\protected@file@percent }
-\newlabel{tab:components}{{2}{5}{Component sizes (pure Python, stdlib only)}{table.caption.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Packaging and Distribution}{5}{subsection.6.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{5}{section.7}\protected@file@percent }
-\newlabel{sec:eval}{{7}{5}{Evaluation}{section.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}End-to-End Latency}{5}{subsection.7.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces End-to-end command latency (median of 50 runs).}}{5}{table.caption.6}\protected@file@percent }
-\newlabel{tab:latency}{{3}{5}{End-to-end command latency (median of 50 runs)}{table.caption.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Polling Efficiency}{5}{subsection.7.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Comparison with Alternatives}{5}{subsection.7.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Comparison with alternative dom0 access mechanisms.}}{5}{table.caption.7}\protected@file@percent }
-\newlabel{tab:comparison}{{4}{5}{Comparison with alternative dom0 access mechanisms}{table.caption.7}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Applications}{5}{section.8}\protected@file@percent }
-\newlabel{sec:applications}{{8}{5}{Applications}{section.8}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{5}{section.9}\protected@file@percent }
-\newlabel{sec:related}{{9}{5}{Related Work}{section.9}{}}
 \citation{russinovich2012windows}
 \citation{stevens2003unix}
 \citation{lamport2002specifying}
@@ -123,6 +125,14 @@
 \bibcite{bellare2006new}{7}
 \bibcite{bellare1996keying}{8}
 \bibcite{xi2023rise}{9}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Comparison with alternative dom0 access mechanisms.}}{6}{table.caption.10}\protected@file@percent }
+\newlabel{tab:comparison}{{4}{6}{Comparison with alternative dom0 access mechanisms}{table.caption.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{6}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{6}{Related Work}{section.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Discussion}{6}{section.10}\protected@file@percent }
+\newlabel{sec:discussion}{{10}{6}{Discussion}{section.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{6}{section.11}\protected@file@percent }
+\newlabel{sec:conclusion}{{11}{6}{Conclusion}{section.11}{}}
 \bibcite{openai2024agents}{10}
 \bibcite{qubes2024qrexec}{11}
 \bibcite{qubes2024vchan}{12}
@@ -137,10 +147,6 @@
 \bibcite{poettering2010systemd}{21}
 \bibcite{oliner2012advances}{22}
 \bibcite{qubes2023splitgpg}{23}
-\@writefile{toc}{\contentsline {section}{\numberline {10}Discussion}{6}{section.10}\protected@file@percent }
-\newlabel{sec:discussion}{{10}{6}{Discussion}{section.10}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{6}{section.11}\protected@file@percent }
-\newlabel{sec:conclusion}{{11}{6}{Conclusion}{section.11}{}}
 \bibcite{qubes2024u2f}{24}
 \bibcite{qubes2024builder}{25}
 \bibcite{neuman2005kerberos}{26}
