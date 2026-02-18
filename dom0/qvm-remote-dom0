@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac as _hmac
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,6 +29,7 @@ PROGNAME = "qvm-remote-dom0"
 
 CONF = Path("/etc/qubes/remote.conf")
 KEYS_DIR = Path("/etc/qubes/remote.d")
+WORK_DIR = Path("/var/run/qvm-remote")
 LOG_FILE = Path("/var/log/qubes/qvm-remote.log")
 DEFAULT_VM_USER = "user"
 VM_DATA_DIR = f"/home/{DEFAULT_VM_USER}/.qvm-remote"
@@ -35,6 +37,43 @@ SERVICE = "qvm-remote-dom0"
 MAX_OUTPUT = 10 << 20    # 10 MiB
 MAX_CMD_SIZE = 1 << 20   # 1 MiB
 EXEC_TIMEOUT = 300       # seconds per command (matches client default)
+MAX_LOG_SNIPPET = 160    # max chars per output snippet line in log
+
+# ── ANSI color codes ─────────────────────────────────────────────────
+
+class _C:
+    RST = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    MAGENTA = "\033[35m"
+    WHITE = "\033[37m"
+    BLUE = "\033[34m"
+    BGREEN = "\033[92m"
+    BRED = "\033[91m"
+    BYELLOW = "\033[93m"
+    BCYAN = "\033[96m"
+
+_LOG_COLORS = {
+    "INFO":      _C.CYAN,
+    "EXEC":      _C.BOLD + _C.WHITE,
+    "CMD":       _C.YELLOW,
+    "AUTH-OK":   _C.GREEN,
+    "AUTH-FAIL": _C.RED + _C.BOLD,
+    "AUTH-DENY": _C.RED + _C.BOLD,
+    "REJECT":    _C.RED,
+    "OUT":       _C.DIM + _C.BGREEN,
+    "ERR":       _C.DIM + _C.BRED,
+    "DONE":      _C.GREEN,
+    "DONE-FAIL": _C.BYELLOW,
+    "ERROR":     _C.RED + _C.BOLD,
+    "TIMEOUT":   _C.RED + _C.BOLD,
+    "TRUNC":     _C.MAGENTA,
+    "DRY":       _C.MAGENTA,
+}
 
 USAGE = """\
 usage: qvm-remote-dom0 [--vm VM] [--once] [--dry-run]
@@ -58,17 +97,6 @@ key management:
   revoke VM            revoke VM authorization
   keys                 list authorized VMs
 
-connection management:
-  connect VM [KEY]     authorize + add to config + init VM dirs
-  disconnect VM        revoke + remove from config + clean VM queue
-  status               show daemon state, connected VMs, queue health
-
-queue management:
-  queue status [VM]    show queue counts for all or one VM
-  queue clean [VM]     remove stale entries from VM queues
-  queue recover [VM]   fail stuck running commands (returns error to client)
-  queue debug [VM]     detailed queue dump for troubleshooting
-
 service:
   enable               enable autostart (interactive risk prompt)
   disable              disable autostart and stop
@@ -89,25 +117,41 @@ def die(msg: str, code: int = 1) -> NoReturn:
     sys.exit(code)
 
 
-def require_root(action: str = "") -> None:
-    """Exit with a clear message when not running as root."""
-    if os.geteuid() != 0:
-        hint = f" to {action}" if action else ""
-        die(
-            f"must run as root{hint}\n"
-            f"  hint: sudo {PROGNAME} {' '.join(sys.argv[1:])}"
-        )
-
-
-def log(msg: str) -> None:
+def log(msg: str, cat: str = "INFO") -> None:
     ts = datetime.now().isoformat(timespec="seconds")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    file_line = f"[{ts}] {cat} {msg}"
+    color = _LOG_COLORS.get(cat, "")
+    term_line = (
+        f"{_C.DIM}[{ts}]{_C.RST} "
+        f"{color}{cat:<9s}{_C.RST} "
+        f"{color}{msg}{_C.RST}"
+    )
+    print(term_line, flush=True)
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(line + "\n")
+            f.write(file_line + "\n")
     except OSError:
         pass
+
+
+def _log_output_snippet(vm: str, cmd_id: str,
+                        out_data: bytes, err_data: bytes) -> None:
+    """Log shortened stdout/stderr snippets for visual tracing."""
+    for label, data, cat in (
+        ("stdout", out_data, "OUT"), ("stderr", err_data, "ERR"),
+    ):
+        text = data.decode(errors="replace").strip()
+        if not text:
+            continue
+        lines = text.splitlines()
+        if len(lines) <= 3:
+            for ln in lines:
+                snip = ln[:MAX_LOG_SNIPPET]
+                log(f"  {label}: {snip}", cat)
+        else:
+            log(f"  {label}: {lines[0][:MAX_LOG_SNIPPET]}", cat)
+            log(f"  {label}: ... ({len(lines) - 2} more lines)", cat)
+            log(f"  {label}: {lines[-1][:MAX_LOG_SNIPPET]}", cat)
 
 
 def hmac_token(key: str, cmd_id: str) -> str:
@@ -251,34 +295,6 @@ def init_vm_dirs(vm: str) -> None:
     )
 
 
-def recover_stale_running(vm: str) -> None:
-    """On daemon start, fail any commands left in running/ from a prior crash."""
-    raw = vm_exec(
-        vm, f"ls -1 {VM_DATA_DIR}/queue/running/ 2>/dev/null"
-    )
-    stale = [f.strip().replace("\r", "") for f in raw.splitlines() if f.strip()]
-    for cmd_id in stale:
-        log(f"RECOVER vm={vm} id={cmd_id} (stale from prior daemon run)")
-        ts = datetime.now().isoformat(timespec="seconds")
-        vm_write(
-            vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.out", b""
-        )
-        vm_write(
-            vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.err",
-            b"qvm-remote-dom0: command interrupted (daemon restarted)\n",
-        )
-        vm_write(
-            vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.exit", b"130"
-        )
-        meta = (
-            f"id={cmd_id}\nstarted=unknown\n"
-            f"duration_ms=0\nexit_code=130\n"
-            f"recovered={ts}\n"
-        ).encode()
-        vm_write(vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.meta", meta)
-        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/running/{cmd_id}'")
-
-
 def list_pending(vm: str) -> list[str]:
     raw = vm_exec(
         vm, f"ls -1 {VM_DATA_DIR}/queue/pending/ 2>/dev/null"
@@ -293,7 +309,6 @@ def list_pending(vm: str) -> list[str]:
 # ── key management ───────────────────────────────────────────────────
 
 def cmd_authorize(args: list[str]) -> int:
-    require_root("authorize a VM")
     if not args:
         die("usage: authorize VM [KEY]")
     vm = args[0]
@@ -320,7 +335,6 @@ def cmd_authorize(args: list[str]) -> int:
 
 
 def cmd_revoke(args: list[str]) -> int:
-    require_root("revoke a VM")
     if not args:
         die("usage: revoke VM")
     vm = args[0]
@@ -347,7 +361,6 @@ def cmd_keys() -> int:
 # ── service management ───────────────────────────────────────────────
 
 def cmd_enable() -> int:
-    require_root("enable the service")
     print()
     print("WARNING: Enabling autostart for qvm-remote-dom0.")
     print()
@@ -362,421 +375,23 @@ def cmd_enable() -> int:
     if answer != "yes":
         print("Aborted.")
         return 1
-    r1 = subprocess.run(
-        ["systemctl", "enable", SERVICE],
-        capture_output=True, text=True, timeout=30,
-    )
-    if r1.returncode != 0:
-        die(f"systemctl enable failed: {r1.stderr.strip()}")
-    r2 = subprocess.run(
-        ["systemctl", "start", SERVICE],
-        capture_output=True, text=True, timeout=30,
-    )
-    if r2.returncode != 0:
-        die(f"systemctl start failed: {r2.stderr.strip()}")
+    subprocess.run(["systemctl", "enable", SERVICE], timeout=30)
+    subprocess.run(["systemctl", "start", SERVICE], timeout=30)
     print(f"\nEnabled and started. Disable with: {PROGNAME} disable")
     return 0
 
 
 def cmd_disable() -> int:
-    require_root("disable the service")
-    r1 = subprocess.run(
+    subprocess.run(
         ["systemctl", "disable", SERVICE],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, timeout=30,
     )
-    r2 = subprocess.run(
+    subprocess.run(
         ["systemctl", "stop", SERVICE],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, timeout=30,
     )
-    if r1.returncode != 0 or r2.returncode != 0:
-        err = (r1.stderr.strip() + " " + r2.stderr.strip()).strip()
-        die(f"systemctl failed: {err}")
     print("Disabled and stopped.")
     return 0
-
-
-# ── connection management ────────────────────────────────────────────
-
-def _read_conf_vms() -> list[str]:
-    """Read the current QVM_REMOTE_VMS list from config file."""
-    if not CONF.exists():
-        return []
-    for raw in CONF.read_text().splitlines():
-        s = raw.strip()
-        if s.startswith("QVM_REMOTE_VMS="):
-            val = s.split("=", 1)[1].strip().strip('"').strip("'")
-            return val.split() if val else []
-    return []
-
-
-def _write_conf_vms(vms: list[str]) -> None:
-    """Update QVM_REMOTE_VMS in config file, preserving other lines."""
-    new_line = f'QVM_REMOTE_VMS="{" ".join(vms)}"'
-    if CONF.exists():
-        lines = CONF.read_text().splitlines()
-        replaced = False
-        for i, raw in enumerate(lines):
-            if raw.strip().startswith("QVM_REMOTE_VMS=") or \
-               raw.strip().startswith("#QVM_REMOTE_VMS="):
-                lines[i] = new_line
-                replaced = True
-                break
-        if not replaced:
-            lines.append(new_line)
-        CONF.write_text("\n".join(lines) + "\n")
-    else:
-        CONF.parent.mkdir(parents=True, exist_ok=True)
-        CONF.write_text(new_line + "\n")
-
-
-def cmd_connect(args: list[str]) -> int:
-    """Full connection setup: authorize key + add to config + init VM dirs."""
-    require_root("connect a VM")
-    if not args:
-        die("usage: connect VM [KEY]")
-    vm = args[0]
-
-    r = subprocess.run(["qvm-check", vm], capture_output=True, timeout=10)
-    if r.returncode != 0:
-        die(f"VM '{vm}' does not exist")
-
-    r = subprocess.run(
-        ["qvm-check", vm, "--running"],
-        capture_output=True, timeout=10,
-    )
-    if r.returncode != 0:
-        die(f"VM '{vm}' is not running (start it first: qvm-start {vm})")
-
-    if len(args) > 1:
-        key = args[1].strip()
-    else:
-        print(f"Fetching key from VM '{vm}'...")
-        try:
-            data_path = vm_data_dir()
-            raw = vm_exec(vm, f"cat {data_path}/auth.key 2>/dev/null")
-            key = raw.strip()
-        except Exception:
-            key = ""
-        if not key:
-            die(
-                f"could not fetch key from '{vm}'\n"
-                f"  hint: in the VM run: qvm-remote key gen\n"
-                f"  then: qvm-remote-dom0 connect {vm} <KEY>"
-            )
-
-    if not valid_hex_key(key):
-        die("invalid key (expected 64 hex characters)")
-
-    try:
-        KEYS_DIR.mkdir(parents=True, exist_ok=True)
-        KEYS_DIR.chmod(0o700)
-        kf = KEYS_DIR / f"{vm}.key"
-        kf.write_text(key)
-        kf.chmod(0o600)
-    except OSError as e:
-        die(f"failed to store key: {e}")
-
-    conf_vms = _read_conf_vms()
-    if vm not in conf_vms:
-        conf_vms.append(vm)
-        _write_conf_vms(conf_vms)
-
-    data_path = vm_data_dir()
-    vm_fire(
-        vm,
-        f"mkdir -p {data_path}/{{queue/{{pending,running,results}},history}}",
-    )
-
-    print(f"Connected VM '{vm}'.")
-    print(f"  Key:    {key[:16]}...")
-    print(f"  Config: {CONF}")
-    print(f"  VMs:    {' '.join(conf_vms)}")
-
-    svc = subprocess.run(
-        ["systemctl", "is-active", SERVICE],
-        capture_output=True, text=True, timeout=5,
-    )
-    if svc.stdout.strip() != "active":
-        print(f"\n  Daemon is not running. Start it:")
-        print(f"    systemctl restart {SERVICE}")
-    else:
-        print(f"\n  Daemon is running. Restart to pick up new VM:")
-        print(f"    systemctl restart {SERVICE}")
-
-    log(f"CONNECT vm={vm}")
-    return 0
-
-
-def cmd_disconnect(args: list[str]) -> int:
-    """Disconnect a VM: revoke key + remove from config + clean queue."""
-    require_root("disconnect a VM")
-    if not args:
-        die("usage: disconnect VM")
-    vm = args[0]
-
-    kf = KEYS_DIR / f"{vm}.key"
-    if kf.exists():
-        kf.unlink()
-
-    conf_vms = _read_conf_vms()
-    if vm in conf_vms:
-        conf_vms.remove(vm)
-        _write_conf_vms(conf_vms)
-
-    try:
-        data_path = vm_data_dir()
-        r = subprocess.run(
-            ["qvm-check", vm, "--running"],
-            capture_output=True, timeout=5,
-        )
-        if r.returncode == 0:
-            cleaned = 0
-            for subdir in ("pending", "running", "results"):
-                raw = vm_exec(
-                    vm, f"ls -1 {data_path}/queue/{subdir}/ 2>/dev/null | wc -l"
-                )
-                cleaned += int(raw.strip() or "0")
-            vm_fire(vm, f"rm -rf {data_path}/queue/{{pending,running,results}}/*")
-            print(f"Cleaned {cleaned} queue file(s) in VM '{vm}'.")
-    except Exception:
-        pass
-
-    print(f"Disconnected VM '{vm}'.")
-    print(f"  Key revoked, removed from config.")
-    if conf_vms:
-        print(f"  Remaining VMs: {' '.join(conf_vms)}")
-    else:
-        print(f"  No VMs remaining in config.")
-
-    svc = subprocess.run(
-        ["systemctl", "is-active", SERVICE],
-        capture_output=True, text=True, timeout=5,
-    )
-    if svc.stdout.strip() == "active":
-        print(f"\n  Restart daemon to stop polling disconnected VM:")
-        print(f"    systemctl restart {SERVICE}")
-
-    log(f"DISCONNECT vm={vm}")
-    return 0
-
-
-def cmd_status_report() -> int:
-    """Full daemon status report: service, config, VMs, keys, queue health."""
-    svc = subprocess.run(
-        ["systemctl", "is-active", SERVICE],
-        capture_output=True, text=True, timeout=5,
-    )
-    active = svc.stdout.strip() == "active"
-    en = subprocess.run(
-        ["systemctl", "is-enabled", SERVICE],
-        capture_output=True, text=True, timeout=5,
-    )
-    enabled = en.stdout.strip() == "enabled"
-
-    print(f"qvm-remote-dom0 {VERSION}")
-    print(f"  Service:   {'running' if active else 'STOPPED'}")
-    print(f"  Autostart: {'enabled' if enabled else 'disabled'}")
-    print(f"  Config:    {CONF}")
-    print(f"  Keys dir:  {KEYS_DIR}")
-    print(f"  Log:       {LOG_FILE}")
-
-    conf_vms = _read_conf_vms()
-    key_vms = []
-    if KEYS_DIR.exists():
-        key_vms = [kf.stem for kf in sorted(KEYS_DIR.glob("*.key"))]
-
-    print(f"\nConfigured VMs: {' '.join(conf_vms) if conf_vms else '(none)'}")
-    print(f"Authorized VMs: {' '.join(key_vms) if key_vms else '(none)'}")
-
-    mismatched = set(conf_vms) - set(key_vms)
-    if mismatched:
-        print(f"\n  WARNING: VMs in config but no key: {' '.join(mismatched)}")
-        print(f"  These VMs will have AUTH-DENY errors.")
-
-    orphan_keys = set(key_vms) - set(conf_vms)
-    if orphan_keys:
-        print(f"\n  INFO: VMs with keys but not in config: {' '.join(orphan_keys)}")
-        print(f"  These VMs are authorized but won't be polled.")
-
-    data_path = vm_data_dir()
-    for vm in conf_vms:
-        r = subprocess.run(
-            ["qvm-check", vm, "--running"],
-            capture_output=True, timeout=5,
-        )
-        running = r.returncode == 0
-        has_key = vm in key_vms
-        status_parts = []
-        if running:
-            status_parts.append("running")
-        else:
-            status_parts.append("STOPPED")
-        if has_key:
-            status_parts.append("key-ok")
-        else:
-            status_parts.append("NO-KEY")
-
-        q_info = ""
-        if running:
-            try:
-                raw = vm_exec(
-                    vm,
-                    f"echo -n P=$(ls -1 {data_path}/queue/pending/ 2>/dev/null "
-                    f"| grep -cv '^$' || echo 0)' '"
-                    f"R=$(ls -1 {data_path}/queue/running/ 2>/dev/null "
-                    f"| grep -cv '^$' || echo 0)' '"
-                    f"D=$(ls -1 {data_path}/queue/results/ 2>/dev/null "
-                    f"| grep -cv '^$' || echo 0)",
-                )
-                q_info = f"  queue=[{raw.strip()}]"
-            except Exception:
-                q_info = "  queue=[error]"
-
-        print(f"  {vm:<20} {', '.join(status_parts)}{q_info}")
-
-    return 0
-
-
-def cmd_queue_op(args: list[str]) -> int:
-    """Queue management: status, clean, recover, debug."""
-    if not args:
-        args = ["status"]
-    action = args[0]
-    target_vm = args[1] if len(args) > 1 else None
-
-    conf_vms = _read_conf_vms()
-    if target_vm:
-        vms = [target_vm]
-    elif conf_vms:
-        vms = conf_vms
-    else:
-        die("no VMs configured")
-
-    data_path = vm_data_dir()
-
-    if action == "status":
-        print(f"{'VM':<20} {'Pending':>8} {'Running':>8} {'Results':>8}")
-        print(f"{'─'*20} {'─'*8} {'─'*8} {'─'*8}")
-        for vm in vms:
-            r = subprocess.run(
-                ["qvm-check", vm, "--running"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
-                print(f"{vm:<20} {'(not running)':>26}")
-                continue
-            try:
-                counts = {}
-                for subdir in ("pending", "running", "results"):
-                    raw = vm_exec(
-                        vm,
-                        f"ls -1 {data_path}/queue/{subdir}/ 2>/dev/null "
-                        f"| grep -cv '^$' || echo 0",
-                    )
-                    counts[subdir] = raw.strip()
-                print(f"{vm:<20} {counts['pending']:>8} "
-                      f"{counts['running']:>8} {counts['results']:>8}")
-            except Exception:
-                print(f"{vm:<20} {'(error)':>26}")
-        return 0
-
-    if action == "clean":
-        for vm in vms:
-            r = subprocess.run(
-                ["qvm-check", vm, "--running"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
-                print(f"{vm}: not running, skipped")
-                continue
-            raw = vm_exec(
-                vm,
-                f"find {data_path}/queue/ -type f 2>/dev/null | wc -l",
-            )
-            before = int(raw.strip() or "0")
-            vm_fire(
-                vm,
-                f"rm -rf {data_path}/queue/{{pending,running,results}}/* && "
-                f"mkdir -p {data_path}/queue/{{pending,running,results}}",
-            )
-            print(f"{vm}: cleaned {before} file(s)")
-            log(f"QUEUE-CLEAN vm={vm} removed={before}")
-        return 0
-
-    if action == "recover":
-        for vm in vms:
-            r = subprocess.run(
-                ["qvm-check", vm, "--running"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
-                print(f"{vm}: not running, skipped")
-                continue
-            raw = vm_exec(
-                vm, f"ls -1 {data_path}/queue/running/ 2>/dev/null"
-            )
-            stale = [
-                f.strip().replace("\r", "")
-                for f in raw.splitlines() if f.strip()
-            ]
-            if not stale:
-                print(f"{vm}: no stale running commands")
-                continue
-            for cmd_id in stale:
-                ts = datetime.now().isoformat(timespec="seconds")
-                vm_write(
-                    vm, f"{data_path}/queue/results/{cmd_id}.out", b""
-                )
-                vm_write(
-                    vm, f"{data_path}/queue/results/{cmd_id}.err",
-                    b"qvm-remote-dom0: command recovered (manual queue recover)\n",
-                )
-                vm_write(
-                    vm, f"{data_path}/queue/results/{cmd_id}.exit", b"130"
-                )
-                meta = (
-                    f"id={cmd_id}\nstarted=unknown\n"
-                    f"duration_ms=0\nexit_code=130\n"
-                    f"recovered={ts}\n"
-                ).encode()
-                vm_write(
-                    vm, f"{data_path}/queue/results/{cmd_id}.meta", meta
-                )
-                vm_fire(vm, f"rm -f '{data_path}/queue/running/{cmd_id}'")
-            print(f"{vm}: recovered {len(stale)} stale command(s)")
-            log(f"QUEUE-RECOVER vm={vm} count={len(stale)}")
-        return 0
-
-    if action == "debug":
-        for vm in vms:
-            print(f"\n{'═'*60}")
-            print(f"VM: {vm}")
-            print(f"{'═'*60}")
-            r = subprocess.run(
-                ["qvm-check", vm, "--running"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
-                print("  (not running)")
-                continue
-            for subdir in ("pending", "running", "results"):
-                raw = vm_exec(
-                    vm,
-                    f"ls -la {data_path}/queue/{subdir}/ 2>/dev/null "
-                    f"|| echo '  (empty)'",
-                )
-                print(f"\n── {subdir}/ ──")
-                print(raw.rstrip())
-            raw = vm_exec(
-                vm,
-                f"tail -5 {data_path}/audit.log 2>/dev/null "
-                f"|| echo '  (no audit log)'",
-            )
-            print(f"\n── audit.log (last 5) ──")
-            print(raw.rstrip())
-        return 0
-
-    die(f"unknown queue action: {action}")
 
 
 # ── process one command ──────────────────────────────────────────────
@@ -785,7 +400,7 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
     started = datetime.now().isoformat(timespec="seconds")
     t0 = time.monotonic_ns()
 
-    log(f"EXEC vm={vm} id={cmd_id}")
+    log(f"vm={vm} id={cmd_id}", "EXEC")
 
     # fetch command as raw bytes
     try:
@@ -793,59 +408,27 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
             vm, f"cat '{VM_DATA_DIR}/queue/pending/{cmd_id}'"
         )
     except Exception:
-        log(f"ERROR vm={vm} id={cmd_id} fetch-failed")
+        log(f"vm={vm} id={cmd_id} fetch-failed", "ERROR")
         return False
 
-    # ── validation (before execution) ───────────────────────────
-    def reject(reason: str) -> bool:
-        log(f"REJECT vm={vm} id={cmd_id} {reason}")
-        vm_fire(
-            vm,
-            f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}' "
-            f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.auth' "
-            f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.cmd'",
-        )
-        return False
-
+    # ── validation (before touching disk) ────────────────────────
     if len(script_bytes) == 0:
-        return reject("empty-command")
+        log(f"vm={vm} id={cmd_id} empty-command", "REJECT")
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
     if len(script_bytes) > MAX_CMD_SIZE:
-        return reject(f"oversized ({len(script_bytes)} bytes)")
+        log(
+            f"vm={vm} id={cmd_id} "
+            f"oversized ({len(script_bytes)} bytes)", "REJECT"
+        )
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
     if has_binary_content(script_bytes):
-        return reject("binary-content")
+        log(f"vm={vm} id={cmd_id} binary-content", "REJECT")
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
 
     # ── HMAC verification ────────────────────────────────────────
-    def auth_reject(reason: str, write_error: bool = False) -> bool:
-        """Reject with full cleanup and optional error result for the client."""
-        log(f"{reason} vm={vm} id={cmd_id}")
-        if write_error:
-            vm_write(
-                vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.out", b""
-            )
-            vm_write(
-                vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.err",
-                f"qvm-remote-dom0: {reason.lower()} for id={cmd_id}\n".encode(),
-            )
-            vm_write(
-                vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.exit", b"126"
-            )
-            ts = datetime.now().isoformat(timespec="seconds")
-            meta = (
-                f"id={cmd_id}\nstarted={ts}\n"
-                f"duration_ms=0\nexit_code=126\n"
-                f"error={reason}\n"
-            ).encode()
-            vm_write(
-                vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.meta", meta
-            )
-        vm_fire(
-            vm,
-            f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}' "
-            f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.auth' "
-            f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.cmd'",
-        )
-        return False
-
     vm_key = get_vm_key(vm)
     if vm_key:
         vm_token = vm_exec(
@@ -854,23 +437,43 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
             f"2>/dev/null",
         ).strip()
         expected = hmac_token(vm_key, cmd_id)
-        if not vm_token:
-            return auth_reject("AUTH-FAIL-NO-TOKEN", write_error=True)
-        if not _hmac.compare_digest(vm_token, expected):
-            return auth_reject("AUTH-FAIL-BAD-TOKEN", write_error=True)
+        if not vm_token or not _hmac.compare_digest(vm_token, expected):
+            log(f"vm={vm} id={cmd_id}", "AUTH-FAIL")
+            vm_fire(
+                vm,
+                f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}' "
+                f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.auth'",
+            )
+            return False
         vm_fire(
             vm,
             f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}.auth'",
         )
-        log(f"AUTH-OK vm={vm} id={cmd_id}")
+        log(f"vm={vm} id={cmd_id}", "AUTH-OK")
     else:
+        # no key for this VM -- reject if any other keys exist
         if KEYS_DIR.exists() and any(KEYS_DIR.glob("*.key")):
-            return auth_reject("AUTH-DENY", write_error=True)
+            log(f"vm={vm} id={cmd_id} (no key for this VM)", "AUTH-DENY")
+            vm_fire(
+                vm,
+                f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'",
+            )
+            return False
 
     preview = (
         script_bytes[:200].decode(errors="replace").replace("\n", " ")
     )
-    log(f"CMD vm={vm} id={cmd_id} cmd={preview}")
+    log(f"vm={vm} id={cmd_id} cmd={preview}", "CMD")
+
+    # ── write work file with strict permissions ──────────────────
+    work_file = WORK_DIR / f"{cmd_id}.sh"
+    try:
+        work_file.write_bytes(script_bytes)
+        work_file.chmod(0o700)
+    except OSError as e:
+        log(f"vm={vm} id={cmd_id} write-failed: {e}", "ERROR")
+        work_file.unlink(missing_ok=True)
+        return False
 
     # move to running
     vm_fire(
@@ -879,23 +482,23 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
         f"'{VM_DATA_DIR}/queue/running/{cmd_id}'",
     )
 
-    # ── execute (pipe directly to bash, no temp file) ────────────
+    # ── execute ──────────────────────────────────────────────────
     if dry_run:
-        log(f"DRY vm={vm} id={cmd_id} skipped")
+        log(f"vm={vm} id={cmd_id} skipped", "DRY")
         out_data = f"[dry-run] {preview}\n".encode()
         err_data = b""
         rc = 0
     else:
         try:
             r = subprocess.run(
-                ["bash"], input=script_bytes, capture_output=True,
+                ["bash", str(work_file)], capture_output=True,
                 timeout=EXEC_TIMEOUT,
             )
             out_data = r.stdout
             err_data = r.stderr
             rc = r.returncode
         except subprocess.TimeoutExpired:
-            log(f"TIMEOUT vm={vm} id={cmd_id} after={EXEC_TIMEOUT}s")
+            log(f"vm={vm} id={cmd_id} after={EXEC_TIMEOUT}s", "TIMEOUT")
             out_data = b""
             err_data = (
                 f"qvm-remote-dom0: command timed out "
@@ -908,17 +511,19 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
 
     # truncate oversized output
     if len(out_data) > MAX_OUTPUT:
-        log(f"TRUNC vm={vm} id={cmd_id} stdout ({len(out_data)} bytes)")
+        log(f"vm={vm} id={cmd_id} stdout ({len(out_data)} bytes)", "TRUNC")
         out_data = (
             out_data[:MAX_OUTPUT]
             + f"\n[truncated at {MAX_OUTPUT} bytes]\n".encode()
         )
     if len(err_data) > MAX_OUTPUT:
-        log(f"TRUNC vm={vm} id={cmd_id} stderr ({len(err_data)} bytes)")
+        log(f"vm={vm} id={cmd_id} stderr ({len(err_data)} bytes)", "TRUNC")
         err_data = (
             err_data[:MAX_OUTPUT]
             + f"\n[truncated at {MAX_OUTPUT} bytes]\n".encode()
         )
+
+    _log_output_snippet(vm, cmd_id, out_data, err_data)
 
     # write results to VM
     vm_write(
@@ -952,7 +557,9 @@ def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
         f"&& rm -f '{VM_DATA_DIR}/audit.log.tmp'",
     )
 
-    log(f"DONE vm={vm} id={cmd_id} exit={rc} duration={ms}ms")
+    work_file.unlink(missing_ok=True)
+    done_cat = "DONE" if rc == 0 else "DONE-FAIL"
+    log(f"vm={vm} id={cmd_id} exit={rc} duration={ms}ms", done_cat)
     return True
 
 
@@ -1012,14 +619,6 @@ def main() -> int:
             return cmd_revoke(rest[1:])
         if sub == "keys":
             return cmd_keys()
-        if sub == "connect":
-            return cmd_connect(rest[1:])
-        if sub == "disconnect":
-            return cmd_disconnect(rest[1:])
-        if sub == "status":
-            return cmd_status_report()
-        if sub == "queue":
-            return cmd_queue_op(rest[1:])
         if sub == "enable":
             return cmd_enable()
         if sub == "disable":
@@ -1027,7 +626,6 @@ def main() -> int:
         die(f"unknown command: {sub}")
 
     # ── daemon mode ──────────────────────────────────────────────
-    require_root("run the daemon")
     global VM_DATA_DIR  # noqa: PLW0603
     VM_DATA_DIR = vm_data_dir()
 
@@ -1043,16 +641,17 @@ def main() -> int:
         if r.returncode != 0:
             die(f"VM '{vm}' does not exist")
 
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.chmod(0o700)
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    log(f"{PROGNAME} {VERSION} starting (pid={os.getpid()}) vms={vms}")
+    log(f"{PROGNAME} {VERSION} starting (pid={os.getpid()}) vms={vms}", "INFO")
     for vm in vms:
         init_vm_dirs(vm)
-        recover_stale_running(vm)
-    log(f"Listening for commands from: {' '.join(vms)}")
+    log(f"Listening for commands from: {' '.join(vms)}", "INFO")
 
     while _running:
         for vm in vms:
@@ -1068,13 +667,14 @@ def main() -> int:
                 try:
                     process(vm, cmd_id, dry_run=dry_run)
                 except Exception as e:
-                    log(f"ERROR vm={vm} id={cmd_id} {e}")
+                    log(f"vm={vm} id={cmd_id} {e}", "ERROR")
         if run_once:
-            log("Single-run mode, exiting.")
+            log("Single-run mode, exiting.", "INFO")
             break
         time.sleep(1)
 
-    log(f"Shutting down (pid={os.getpid()})")
+    log(f"Shutting down (pid={os.getpid()})", "INFO")
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
     return 0
 
 
@@ -1083,12 +683,3 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-    except PermissionError as e:
-        print(
-            f"{PROGNAME}: permission denied: {e}\n"
-            f"  hint: this command must run as root in dom0",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    except BrokenPipeError:
-        sys.exit(141)
