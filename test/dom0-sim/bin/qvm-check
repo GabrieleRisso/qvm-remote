@@ -1,0 +1,3 @@
+#!/bin/bash
+# Mock qvm-check — always reports VM exists.
+exit 0

@@ -1,0 +1,81 @@
+#!/bin/bash
+# mock-qvm-run -- simulates qvm-run --pass-io for file-based VM access
+#
+# Real behavior: qvm-run --pass-io --no-gui --no-autostart VM "CMD"
+#   runs CMD inside VM and pipes stdout back.
+#
+# This mock:
+#   - Extracts VM name and command from arguments
+#   - For "cat '/path'" commands: reads from /sim/vms/<VM>/path
+#   - For "ls" commands: lists from /sim/vms/<VM>/path
+#   - For other commands (mkdir, mv, rm, etc.): succeeds silently
+#   - Logs all calls to /var/log/mock-qvm-run.log
+
+VM_ROOT="/sim/vms"
+LOGFILE="/var/log/mock-qvm-run.log"
+
+VM=""
+CMD=""
+PASS_IO=0
+
+# Parse arguments exactly like real qvm-run
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pass-io)       PASS_IO=1; shift ;;
+        --no-gui)        shift ;;
+        --no-autostart)  shift ;;
+        --no-*)          shift ;;
+        -*)              shift ;;
+        *)
+            if [[ -z "$VM" ]]; then
+                VM="$1"
+            else
+                CMD="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+echo "[$(date -Iseconds)] vm=$VM pass_io=$PASS_IO cmd=$CMD" >> "$LOGFILE" 2>/dev/null
+
+if [[ -z "$VM" ]]; then
+    echo "mock-qvm-run: missing VM name" >&2
+    exit 1
+fi
+
+# Check VM exists in simulation
+if ! grep -qxF "$VM" /sim/known_vms 2>/dev/null; then
+    echo "mock-qvm-run: VM '$VM' does not exist" >&2
+    exit 1
+fi
+
+# Handle cat commands: cat '/path/to/file' or cat /path/to/file
+if [[ "$CMD" =~ ^cat\ \'(.+)\'$ ]]; then
+    FILEPATH="${BASH_REMATCH[1]}"
+elif [[ "$CMD" =~ ^cat\ \>\ \'(.+)\'$ ]]; then
+    # cat > '/path' -- write stdin to file (used by vm_write)
+    FILEPATH="${BASH_REMATCH[1]}"
+    SIMPATH="${VM_ROOT}/${VM}${FILEPATH}"
+    mkdir -p "$(dirname "$SIMPATH")"
+    cat > "$SIMPATH"
+    exit $?
+elif [[ "$CMD" =~ ^cat\ (.+)$ ]]; then
+    FILEPATH="${BASH_REMATCH[1]}"
+else
+    # For non-cat commands (mkdir, mv, rm, ls, etc.) succeed silently
+    # These are fire-and-forget VM operations from the daemon
+    exit 0
+fi
+
+SIMPATH="${VM_ROOT}/${VM}${FILEPATH}"
+
+if [[ -f "$SIMPATH" ]]; then
+    if (( PASS_IO )); then
+        cat "$SIMPATH"
+    fi
+    exit 0
+fi
+
+echo "mock-qvm-run: file not found: $SIMPATH (vm=$VM path=$FILEPATH)" >> "$LOGFILE" 2>/dev/null
+exit 1

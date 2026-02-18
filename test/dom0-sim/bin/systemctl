@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock systemctl — accepts any arguments, returns success.
+# Logs calls for verification.
+echo "[mock-systemctl] $*" >> /tmp/systemctl.log
+exit 0

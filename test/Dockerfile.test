@@ -1,0 +1,114 @@
+# Dockerfile.test -- end-to-end install & verify for qvm-remote
+#
+# Builds RPMs, installs them, and runs verification:
+#   podman build -f test/Dockerfile.test -t qvm-remote-test .
+#
+FROM fedora:41 AS builder
+
+RUN dnf install -y \
+        rpm-build \
+        rpmdevtools \
+        systemd-rpm-macros \
+        make \
+        python3 \
+        createrepo_c \
+    && dnf clean all
+
+WORKDIR /build
+COPY . /build/
+
+RUN make check
+RUN make dist && make rpm
+
+# ── Stage 2: install & verify ─────────────────────────────────────
+FROM fedora:41 AS verify
+
+RUN dnf install -y python3 systemd && dnf clean all
+
+COPY --from=builder /build/build/RPMS/noarch/*.rpm /tmp/rpms/
+COPY --from=builder /build/install/install-dom0.sh /tmp/install-dom0.sh
+COPY --from=builder /build/vm/qvm-remote /tmp/qvm-remote-src
+COPY --from=builder /build/dom0/qvm-remote-dom0 /tmp/qvm-remote-dom0-src
+
+# VM package installs normally; dom0 needs --nodeps (qubes-core-dom0 unavailable outside Qubes)
+RUN rpm -ivh /tmp/rpms/qvm-remote-1*.rpm
+RUN rpm -ivh --nodeps /tmp/rpms/qvm-remote-dom0*.rpm
+
+# verify file placement
+RUN test -x /usr/bin/qvm-remote         || { echo "FAIL: qvm-remote not installed"; exit 1; }
+RUN test -x /usr/bin/qvm-remote-dom0    || { echo "FAIL: qvm-remote-dom0 not installed"; exit 1; }
+RUN test -f /etc/systemd/system/qvm-remote-dom0.service || { echo "FAIL: service not installed"; exit 1; }
+RUN test -f /etc/qubes/remote.conf      || { echo "FAIL: config not installed"; exit 1; }
+
+# verify permissions
+RUN stat -c '%a' /etc/qubes/remote.conf | grep -q 600 \
+    || { echo "FAIL: remote.conf perms"; exit 1; }
+
+# verify CLI works
+RUN qvm-remote --help | grep -q "Execute commands"
+RUN qvm-remote --version | grep -qE '^qvm-remote [0-9]+\.[0-9]+\.[0-9]+$'
+RUN qvm-remote-dom0 --help | grep -q "Dom0 executor"
+RUN qvm-remote-dom0 --version | grep -qE '^qvm-remote-dom0 [0-9]+\.[0-9]+\.[0-9]+$'
+
+# verify key management (gen / show / import)
+RUN mkdir -p /root/.qvm-remote \
+    && qvm-remote key gen > /dev/null 2>&1 \
+    && KEY=$(qvm-remote key show) \
+    && test ${#KEY} -eq 64 \
+    || { echo "FAIL: key gen/show cycle"; exit 1; }
+
+RUN TESTKEY=$(python3 -c "import os; print(os.urandom(32).hex())") \
+    && qvm-remote key import "$TESTKEY" \
+    && GOT=$(qvm-remote key show) \
+    && test "$GOT" = "$TESTKEY" \
+    || { echo "FAIL: key import/show"; exit 1; }
+
+# verify key file permissions
+RUN stat -c '%a' /root/.qvm-remote/auth.key | grep -q 600 \
+    || { echo "FAIL: auth.key perms"; exit 1; }
+
+# verify dom0 key management
+RUN mkdir -p /etc/qubes/remote.d \
+    && TESTKEY=$(python3 -c "import os; print(os.urandom(32).hex())") \
+    && qvm-remote-dom0 authorize testvm "$TESTKEY" \
+    && qvm-remote-dom0 keys | grep -q testvm \
+    && qvm-remote-dom0 revoke testvm \
+    || { echo "FAIL: dom0 key management"; exit 1; }
+
+# verify install script
+RUN bash -n /tmp/install-dom0.sh
+RUN bash /tmp/install-dom0.sh --help | grep -q "vm-name"
+
+# verify service file content
+RUN grep -q 'ExecStart=/usr/bin/qvm-remote-dom0' /etc/systemd/system/qvm-remote-dom0.service
+RUN grep -q 'EnvironmentFile' /etc/systemd/system/qvm-remote-dom0.service
+
+# verify RPM metadata
+RUN rpm -qi qvm-remote | grep -q "Qubes"
+RUN rpm -qi qvm-remote-dom0 | grep -q "Qubes"
+RUN rpm -q --obsoletes qvm-remote | grep -q "qubes-remote"
+RUN rpm -q --obsoletes qvm-remote-dom0 | grep -q "qubes-remote-dom0"
+
+# verify RPM requires python3
+RUN rpm -q --requires qvm-remote | grep -q "python3"
+RUN rpm -q --requires qvm-remote-dom0 | grep -q "python3"
+
+# verify shebangs in installed files
+RUN head -1 /usr/bin/qvm-remote | grep -q python3
+RUN head -1 /usr/bin/qvm-remote-dom0 | grep -q python3
+
+# data migration test: old .qubes-remote -> .qvm-remote
+RUN mkdir -p /tmp/mighome/.qubes-remote \
+    && echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+       > /tmp/mighome/.qubes-remote/auth.key \
+    && HOME=/tmp/mighome qvm-remote key show \
+    && test -d /tmp/mighome/.qvm-remote \
+    && test ! -d /tmp/mighome/.qubes-remote \
+    || { echo "FAIL: data migration"; exit 1; }
+
+# final
+RUN echo "" \
+    && echo "======================================" \
+    && echo "  ALL DOCKER INSTALL TESTS PASSED" \
+    && echo "======================================" \
+    && echo ""

@@ -1,0 +1,9 @@
+host:
+  rpm:
+    build:
+    - rpm_spec/qvm-remote-dom0.spec
+
+vm:
+  rpm:
+    build:
+    - rpm_spec/qvm-remote-vm.spec

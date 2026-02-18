@@ -1,0 +1,21 @@
+# Maintainer: qvm-remote contributors
+# PKGBUILD for qvm-remote -- Qubes OS VM client
+#
+# Only the VM-side client is packaged (dom0 is always Fedora in Qubes OS).
+# Install with: makepkg -si
+
+pkgname=qvm-remote
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Execute commands in Qubes OS dom0 from a VM'
+arch=('any')
+url='https://github.com/user/qvm-remote'
+license=('GPL-2.0-or-later')
+depends=('python>=3.8')
+makedepends=('make')
+source=()
+
+package() {
+    cd "${srcdir}/../.."
+    make install-vm DESTDIR="${pkgdir}"
+}

@@ -1,0 +1,12 @@
+FROM fedora:41
+RUN dnf install -y \
+        rpm-build \
+        rpmdevtools \
+        systemd-rpm-macros \
+        make \
+        python3 \
+        createrepo_c \
+    && dnf clean all
+WORKDIR /build
+COPY . /build/
+RUN make dist && make rpm

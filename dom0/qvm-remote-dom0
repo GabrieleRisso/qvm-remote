@@ -1,0 +1,619 @@
+#!/usr/bin/python3
+# qvm-remote-dom0 -- dom0 executor daemon for qvm-remote
+#
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Dom0 executor daemon for qvm-remote.
+
+Polls authorized VMs for queued commands, verifies HMAC-SHA256
+auth tokens, executes commands in dom0, and writes results back.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac as _hmac
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import NoReturn
+
+VERSION = "1.0.0"
+PROGNAME = "qvm-remote-dom0"
+
+CONF = Path("/etc/qubes/remote.conf")
+KEYS_DIR = Path("/etc/qubes/remote.d")
+WORK_DIR = Path("/var/run/qvm-remote")
+LOG_FILE = Path("/var/log/qubes/qvm-remote.log")
+DEFAULT_VM_USER = "user"
+VM_DATA_DIR = f"/home/{DEFAULT_VM_USER}/.qvm-remote"
+SERVICE = "qvm-remote-dom0"
+MAX_OUTPUT = 10 << 20    # 10 MiB
+MAX_CMD_SIZE = 1 << 20   # 1 MiB
+EXEC_TIMEOUT = 300       # seconds per command (matches client default)
+
+USAGE = """\
+usage: qvm-remote-dom0 [--vm VM] [--once] [--dry-run]
+       qvm-remote-dom0 authorize VM [KEY]
+       qvm-remote-dom0 revoke VM
+       qvm-remote-dom0 keys
+
+Dom0 executor daemon for qvm-remote.  Polls authorized VMs for
+commands, verifies HMAC-SHA256 auth tokens, executes in dom0.
+
+daemon options:
+  --vm VM              override VM list (single VM mode)
+  --once               process pending commands once, then exit
+  --dry-run            log commands without executing
+  -v, --verbose        increase verbosity
+  -h, --help           show this help
+  --version            show version
+
+key management:
+  authorize VM [KEY]   authorize VM with 256-bit hex key (or stdin)
+  revoke VM            revoke VM authorization
+  keys                 list authorized VMs
+
+service:
+  enable               enable autostart (interactive risk prompt)
+  disable              disable autostart and stop
+
+setup:
+  # in VM:   qvm-remote key gen
+  # in dom0: qvm-remote-dom0 authorize VMNAME <key>
+  #          systemctl start qvm-remote-dom0
+"""
+
+_running = True
+
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+def die(msg: str, code: int = 1) -> NoReturn:
+    print(f"{PROGNAME}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(msg: str) -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def hmac_token(key: str, cmd_id: str) -> str:
+    """HMAC-SHA256(key, command_id)."""
+    return _hmac.new(
+        key.encode(), cmd_id.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def valid_hex_key(key: str) -> bool:
+    if len(key) != 64:
+        return False
+    try:
+        int(key, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def load_config() -> dict[str, str]:
+    """Parse /etc/qubes/remote.conf (bash-compatible key=value)."""
+    config: dict[str, str] = {}
+    if CONF.exists():
+        for raw in CONF.read_text().splitlines():
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if "=" in s:
+                k, v = s.split("=", 1)
+                config[k.strip()] = v.strip().strip('"').strip("'")
+    return config
+
+
+def resolve_vm_user() -> str:
+    """Resolve the VM-side username: env > config > default ('user')."""
+    v = os.environ.get("QVM_REMOTE_VM_USER", "")
+    if v:
+        return v
+    config = load_config()
+    return config.get("QVM_REMOTE_VM_USER", DEFAULT_VM_USER)
+
+
+def vm_data_dir() -> str:
+    """Return the VM-side data directory path."""
+    return f"/home/{resolve_vm_user()}/.qvm-remote"
+
+
+def get_vm_key(vm: str) -> str | None:
+    kf = KEYS_DIR / f"{vm}.key"
+    if not kf.exists():
+        return None
+    return kf.read_text().strip()
+
+
+def resolve_vms(cli_vm: str | None) -> list[str]:
+    """Resolve VM list: CLI > env (systemd EnvironmentFile) > config."""
+    if cli_vm:
+        return [cli_vm]
+    for var in (
+        "QVM_REMOTE_VMS", "QUBES_REMOTE_VMS",
+        "QVM_REMOTE_VM", "QUBES_REMOTE_VM",
+    ):
+        v = os.environ.get(var, "")
+        if v:
+            return v.split()
+    config = load_config()
+    for var in (
+        "QVM_REMOTE_VMS", "QUBES_REMOTE_VMS",
+        "QVM_REMOTE_VM", "QUBES_REMOTE_VM",
+    ):
+        v = config.get(var, "")
+        if v:
+            return v.split()
+    return []
+
+
+def has_binary_content(data: bytes) -> bool:
+    """Reject null bytes and most control characters."""
+    for b in data:
+        if b <= 0x08:
+            return True
+        if b in (0x0B, 0x0C):
+            return True
+        if 0x0E <= b <= 0x1F:
+            return True
+    return False
+
+
+# ── VM communication ─────────────────────────────────────────────────
+# Uses qvm-run --no-autostart: never start VMs as a side effect.
+
+def vm_exec(vm: str, cmd: str) -> str:
+    """Run command in VM, return stdout as text."""
+    r = subprocess.run(
+        ["qvm-run", "--no-gui", "--no-autostart", "--pass-io", vm, cmd],
+        capture_output=True, text=True, timeout=30,
+    )
+    return r.stdout
+
+
+def vm_exec_bytes(vm: str, cmd: str) -> bytes:
+    """Run command in VM, return raw stdout."""
+    r = subprocess.run(
+        ["qvm-run", "--no-gui", "--no-autostart", "--pass-io", vm, cmd],
+        capture_output=True, timeout=30,
+    )
+    return r.stdout
+
+
+def vm_fire(vm: str, cmd: str) -> None:
+    """Fire-and-forget command in VM."""
+    try:
+        subprocess.run(
+            ["qvm-run", "--no-gui", "--no-autostart", vm, cmd],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def vm_write(vm: str, path: str, data: bytes) -> None:
+    """Write data to a file in VM via qvm-run --pass-io."""
+    subprocess.run(
+        [
+            "qvm-run", "--no-gui", "--no-autostart", "--pass-io",
+            vm, f"cat > '{path}'",
+        ],
+        input=data, capture_output=True, timeout=30,
+    )
+
+
+def init_vm_dirs(vm: str) -> None:
+    vm_user = resolve_vm_user()
+    old_dir = f"/home/{vm_user}/.qubes-remote"
+    vm_fire(
+        vm,
+        f"[ -d {old_dir} ] && "
+        f"[ ! -d {VM_DATA_DIR} ] && "
+        f"mv {old_dir} {VM_DATA_DIR} 2>/dev/null; "
+        f"mkdir -p {VM_DATA_DIR}/{{queue/{{pending,running,results}},history}}",
+    )
+
+
+def list_pending(vm: str) -> list[str]:
+    raw = vm_exec(
+        vm, f"ls -1 {VM_DATA_DIR}/queue/pending/ 2>/dev/null"
+    )
+    return [
+        f.strip().replace("\r", "")
+        for f in raw.splitlines()
+        if f.strip() and not f.strip().endswith((".auth", ".cmd"))
+    ]
+
+
+# ── key management ───────────────────────────────────────────────────
+
+def cmd_authorize(args: list[str]) -> int:
+    if not args:
+        die("usage: authorize VM [KEY]")
+    vm = args[0]
+    if len(args) > 1:
+        key = args[1]
+    else:
+        print(f"Enter 256-bit hex key for '{vm}':")
+        key = input()
+    key = key.strip()
+    if not valid_hex_key(key):
+        die("invalid key (expected 64 hex characters)")
+    try:
+        KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        KEYS_DIR.chmod(0o700)
+        kf = KEYS_DIR / f"{vm}.key"
+        kf.write_text(key)
+        kf.chmod(0o600)
+    except OSError as e:
+        die(f"failed to store key: {e}")
+    print(f"Authorized VM '{vm}'. Key stored in {kf}")
+    print(f"\nEnsure VM is listed in {CONF}:")
+    print(f'  QVM_REMOTE_VMS="{vm}"')
+    return 0
+
+
+def cmd_revoke(args: list[str]) -> int:
+    if not args:
+        die("usage: revoke VM")
+    vm = args[0]
+    kf = KEYS_DIR / f"{vm}.key"
+    if kf.exists():
+        kf.unlink()
+        print(f"Revoked VM '{vm}'.")
+        return 0
+    die(f"VM '{vm}' has no key")
+
+
+def cmd_keys() -> int:
+    if not KEYS_DIR.exists() or not any(KEYS_DIR.glob("*.key")):
+        print("No VMs authorized.")
+        return 0
+    print(f"{'VM':<20} KEY (first 16 chars)")
+    print(f"{'---':<20} ---")
+    for kf in sorted(KEYS_DIR.glob("*.key")):
+        preview = kf.read_text()[:16] + "..."
+        print(f"{kf.stem:<20} {preview}")
+    return 0
+
+
+# ── service management ───────────────────────────────────────────────
+
+def cmd_enable() -> int:
+    print()
+    print("WARNING: Enabling autostart for qvm-remote-dom0.")
+    print()
+    print("This will automatically start on every boot, granting authorized")
+    print("VMs the ability to execute arbitrary commands in dom0 with full")
+    print("root privileges.")
+    print()
+    print("A compromise of any authorized VM would give an attacker")
+    print("complete control over dom0 and every other VM on this system.")
+    print()
+    answer = input("Type 'yes' to accept this risk and enable: ")
+    if answer != "yes":
+        print("Aborted.")
+        return 1
+    subprocess.run(["systemctl", "enable", SERVICE], timeout=30)
+    subprocess.run(["systemctl", "start", SERVICE], timeout=30)
+    print(f"\nEnabled and started. Disable with: {PROGNAME} disable")
+    return 0
+
+
+def cmd_disable() -> int:
+    subprocess.run(
+        ["systemctl", "disable", SERVICE],
+        capture_output=True, timeout=30,
+    )
+    subprocess.run(
+        ["systemctl", "stop", SERVICE],
+        capture_output=True, timeout=30,
+    )
+    print("Disabled and stopped.")
+    return 0
+
+
+# ── process one command ──────────────────────────────────────────────
+
+def process(vm: str, cmd_id: str, *, dry_run: bool = False) -> bool:
+    started = datetime.now().isoformat(timespec="seconds")
+    t0 = time.monotonic_ns()
+
+    log(f"EXEC vm={vm} id={cmd_id}")
+
+    # fetch command as raw bytes
+    try:
+        script_bytes = vm_exec_bytes(
+            vm, f"cat '{VM_DATA_DIR}/queue/pending/{cmd_id}'"
+        )
+    except Exception:
+        log(f"ERROR vm={vm} id={cmd_id} fetch-failed")
+        return False
+
+    # ── validation (before touching disk) ────────────────────────
+    if len(script_bytes) == 0:
+        log(f"REJECT vm={vm} id={cmd_id} empty-command")
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
+    if len(script_bytes) > MAX_CMD_SIZE:
+        log(
+            f"REJECT vm={vm} id={cmd_id} "
+            f"oversized ({len(script_bytes)} bytes)"
+        )
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
+    if has_binary_content(script_bytes):
+        log(f"REJECT vm={vm} id={cmd_id} binary-content")
+        vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'")
+        return False
+
+    # ── HMAC verification ────────────────────────────────────────
+    vm_key = get_vm_key(vm)
+    if vm_key:
+        vm_token = vm_exec(
+            vm,
+            f"cat '{VM_DATA_DIR}/queue/pending/{cmd_id}.auth' "
+            f"2>/dev/null",
+        ).strip()
+        expected = hmac_token(vm_key, cmd_id)
+        if not vm_token or not _hmac.compare_digest(vm_token, expected):
+            log(f"AUTH-FAIL vm={vm} id={cmd_id}")
+            vm_fire(
+                vm,
+                f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}' "
+                f"'{VM_DATA_DIR}/queue/pending/{cmd_id}.auth'",
+            )
+            return False
+        vm_fire(
+            vm,
+            f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}.auth'",
+        )
+        log(f"AUTH-OK vm={vm} id={cmd_id}")
+    else:
+        # no key for this VM -- reject if any other keys exist
+        if KEYS_DIR.exists() and any(KEYS_DIR.glob("*.key")):
+            log(f"AUTH-DENY vm={vm} id={cmd_id} (no key for this VM)")
+            vm_fire(
+                vm,
+                f"rm -f '{VM_DATA_DIR}/queue/pending/{cmd_id}'",
+            )
+            return False
+
+    preview = (
+        script_bytes[:200].decode(errors="replace").replace("\n", " ")
+    )
+    log(f"CMD vm={vm} id={cmd_id} cmd={preview}")
+
+    # ── write work file with strict permissions ──────────────────
+    work_file = WORK_DIR / f"{cmd_id}.sh"
+    try:
+        work_file.write_bytes(script_bytes)
+        work_file.chmod(0o700)
+    except OSError as e:
+        log(f"ERROR vm={vm} id={cmd_id} write-failed: {e}")
+        work_file.unlink(missing_ok=True)
+        return False
+
+    # move to running
+    vm_fire(
+        vm,
+        f"mv '{VM_DATA_DIR}/queue/pending/{cmd_id}' "
+        f"'{VM_DATA_DIR}/queue/running/{cmd_id}'",
+    )
+
+    # ── execute ──────────────────────────────────────────────────
+    if dry_run:
+        log(f"DRY vm={vm} id={cmd_id} skipped")
+        out_data = f"[dry-run] {preview}\n".encode()
+        err_data = b""
+        rc = 0
+    else:
+        try:
+            r = subprocess.run(
+                ["bash", str(work_file)], capture_output=True,
+                timeout=EXEC_TIMEOUT,
+            )
+            out_data = r.stdout
+            err_data = r.stderr
+            rc = r.returncode
+        except subprocess.TimeoutExpired:
+            log(f"TIMEOUT vm={vm} id={cmd_id} after={EXEC_TIMEOUT}s")
+            out_data = b""
+            err_data = (
+                f"qvm-remote-dom0: command timed out "
+                f"after {EXEC_TIMEOUT}s\n"
+            ).encode()
+            rc = 124
+
+    t1 = time.monotonic_ns()
+    ms = (t1 - t0) // 1_000_000
+
+    # truncate oversized output
+    if len(out_data) > MAX_OUTPUT:
+        log(f"TRUNC vm={vm} id={cmd_id} stdout ({len(out_data)} bytes)")
+        out_data = (
+            out_data[:MAX_OUTPUT]
+            + f"\n[truncated at {MAX_OUTPUT} bytes]\n".encode()
+        )
+    if len(err_data) > MAX_OUTPUT:
+        log(f"TRUNC vm={vm} id={cmd_id} stderr ({len(err_data)} bytes)")
+        err_data = (
+            err_data[:MAX_OUTPUT]
+            + f"\n[truncated at {MAX_OUTPUT} bytes]\n".encode()
+        )
+
+    # write results to VM
+    vm_write(
+        vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.out", out_data
+    )
+    vm_write(
+        vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.err", err_data
+    )
+    vm_write(
+        vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.exit",
+        str(rc).encode(),
+    )
+    meta = (
+        f"id={cmd_id}\nstarted={started}\n"
+        f"duration_ms={ms}\nexit_code={rc}\n"
+    ).encode()
+    vm_write(vm, f"{VM_DATA_DIR}/queue/results/{cmd_id}.meta", meta)
+
+    # clear running marker
+    vm_fire(vm, f"rm -f '{VM_DATA_DIR}/queue/running/{cmd_id}'")
+
+    # VM-side audit log
+    audit_entry = (
+        f"[{started}] id={cmd_id} exit={rc} "
+        f"duration={ms}ms cmd={preview}\n"
+    ).encode()
+    vm_write(vm, f"{VM_DATA_DIR}/audit.log.tmp", audit_entry)
+    vm_fire(
+        vm,
+        f"cat '{VM_DATA_DIR}/audit.log.tmp' >> '{VM_DATA_DIR}/audit.log' "
+        f"&& rm -f '{VM_DATA_DIR}/audit.log.tmp'",
+    )
+
+    work_file.unlink(missing_ok=True)
+    log(f"DONE vm={vm} id={cmd_id} exit={rc} duration={ms}ms")
+    return True
+
+
+# ── signal handling ──────────────────────────────────────────────────
+
+def _on_signal(signum: int, frame: object) -> None:
+    global _running
+    _running = False
+
+
+# ── main ─────────────────────────────────────────────────────────────
+
+def main() -> int:
+    global _running
+
+    cli_vm: str | None = None
+    run_once = False
+    dry_run = False
+    verbose = False
+    rest: list[str] = []
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(USAGE, end="")
+            return 0
+        if a == "--version":
+            print(f"{PROGNAME} {VERSION}")
+            return 0
+        if a == "--vm":
+            if i + 1 >= len(args):
+                die("--vm requires a value")
+            cli_vm = args[i + 1]
+            i += 2
+            continue
+        if a == "--once":
+            run_once = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif a in ("-v", "--verbose"):
+            verbose = True
+        elif a.startswith("-"):
+            die(f"unknown option: {a}")
+        else:
+            rest = args[i:]
+            break
+        i += 1
+
+    # dispatch subcommands
+    if rest:
+        sub = rest[0]
+        if sub == "authorize":
+            return cmd_authorize(rest[1:])
+        if sub == "revoke":
+            return cmd_revoke(rest[1:])
+        if sub == "keys":
+            return cmd_keys()
+        if sub == "enable":
+            return cmd_enable()
+        if sub == "disable":
+            return cmd_disable()
+        die(f"unknown command: {sub}")
+
+    # ── daemon mode ──────────────────────────────────────────────
+    global VM_DATA_DIR  # noqa: PLW0603
+    VM_DATA_DIR = vm_data_dir()
+
+    vms = resolve_vms(cli_vm)
+    if not vms:
+        die(
+            f"no VMs configured. "
+            f"Set QVM_REMOTE_VMS in {CONF} or use --vm VM"
+        )
+
+    for vm in vms:
+        r = subprocess.run(["qvm-check", vm], capture_output=True)
+        if r.returncode != 0:
+            die(f"VM '{vm}' does not exist")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.chmod(0o700)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    log(f"{PROGNAME} {VERSION} starting (pid={os.getpid()}) vms={vms}")
+    for vm in vms:
+        init_vm_dirs(vm)
+    log(f"Listening for commands from: {' '.join(vms)}")
+
+    while _running:
+        for vm in vms:
+            if not _running:
+                break
+            try:
+                pending = list_pending(vm)
+            except Exception:
+                pending = []
+            for cmd_id in pending:
+                if not _running:
+                    break
+                try:
+                    process(vm, cmd_id, dry_run=dry_run)
+                except Exception as e:
+                    log(f"ERROR vm={vm} id={cmd_id} {e}")
+        if run_once:
+            log("Single-run mode, exiting.")
+            break
+        time.sleep(1)
+
+    log(f"Shutting down (pid={os.getpid()})")
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

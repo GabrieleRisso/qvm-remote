@@ -1,0 +1,22 @@
+build/
+pkgs/
+*.rpm
+*.deb
+*.pkg.tar.*
+*.tar.gz
+*.tar.xz
+
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cursor IDE
+.cursor/
+
+# Runtime data (never commit)
+.qubes-remote/
+
+# GPG private keys (public .asc keys ARE tracked)
+keys/*.gpg
+keys/*.key

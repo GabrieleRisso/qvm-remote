@@ -1,0 +1,20 @@
+[Unit]
+Description=qvm-remote-dom0 — VM-to-dom0 command bridge
+After=qubesd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qvm-remote-dom0
+EnvironmentFile=-/etc/qubes/remote.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardened work directory
+RuntimeDirectory=qvm-remote
+RuntimeDirectoryMode=0700
+
+[Install]
+# Not enabled by default.  Use: qvm-remote-dom0 enable
+WantedBy=multi-user.target

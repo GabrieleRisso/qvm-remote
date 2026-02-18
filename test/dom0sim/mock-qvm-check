@@ -1,0 +1,27 @@
+#!/bin/bash
+# mock-qvm-check -- simulates qvm-check for known VMs
+#
+# Real behavior: qvm-check VMNAME returns 0 if VM exists, 2 if not.
+# This mock reads from /sim/known_vms (one VM name per line).
+
+KNOWN_VMS="/sim/known_vms"
+VM=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --*) continue ;;
+        *)   VM="$arg" ;;
+    esac
+done
+
+if [[ -z "$VM" ]]; then
+    echo "qvm-check: missing VM name" >&2
+    exit 1
+fi
+
+if grep -qxF "$VM" "$KNOWN_VMS" 2>/dev/null; then
+    exit 0
+fi
+
+echo "qvm-check: VM '$VM' does not exist" >&2
+exit 2

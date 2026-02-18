@@ -1,0 +1,78 @@
+# Dockerfile.dom0-sim — Simulated dom0 integration test.
+#
+# Builds RPMs in stage 1, then creates a Fedora 41 "dom0" environment
+# with mock Qubes tools and runs the full daemon end-to-end test suite.
+#
+# Build:
+#   podman build -f test/Dockerfile.dom0-sim -t qvm-remote-dom0-sim .
+#
+# The test exercises:
+#   - install-dom0.sh with mock qvm-run/qvm-check/hostname
+#   - key generation, authorization, revocation
+#   - daemon --once: command execution, HMAC verification, result delivery
+#   - multi-command batches, multi-line scripts, non-zero exit codes
+#   - auth failure (bad token, missing token, revoked key)
+#   - dry-run mode
+#   - logging (dom0 + VM audit log)
+#   - data migration (.qubes-remote -> .qvm-remote)
+#   - RPM metadata (obsoletes, requires, group)
+
+# ── Stage 1: Build RPMs ──────────────────────────────────────────
+FROM fedora:41 AS builder
+
+RUN dnf install -y \
+        rpm-build \
+        rpmdevtools \
+        systemd-rpm-macros \
+        make \
+        python3 \
+        createrepo_c \
+    && dnf clean all
+
+WORKDIR /build
+COPY . /build/
+RUN make check
+RUN make dist && make rpm
+
+# ── Stage 2: Simulated dom0 ──────────────────────────────────────
+FROM fedora:41 AS dom0-sim
+
+RUN dnf install -y python3 bash && dnf clean all
+
+# Install mock Qubes OS tools (shadow real binaries via PATH priority)
+COPY test/dom0-sim/bin/qvm-run    /usr/local/bin/qvm-run
+COPY test/dom0-sim/bin/qvm-check  /usr/local/bin/qvm-check
+COPY test/dom0-sim/bin/hostname   /usr/local/bin/hostname
+COPY test/dom0-sim/bin/systemctl  /usr/local/bin/systemctl
+RUN chmod +x /usr/local/bin/qvm-run \
+             /usr/local/bin/qvm-check \
+             /usr/local/bin/hostname \
+             /usr/local/bin/systemctl
+
+# Verify mocks are in PATH and working
+RUN command -v qvm-run | grep -q /usr/local/bin
+RUN command -v hostname | grep -q /usr/local/bin
+RUN hostname | grep -q dom0
+
+# Install RPMs
+COPY --from=builder /build/build/RPMS/noarch/*.rpm /tmp/rpms/
+RUN rpm -ivh /tmp/rpms/qvm-remote-1*.rpm
+RUN rpm -ivh --nodeps /tmp/rpms/qvm-remote-dom0*.rpm
+
+# Verify RPMs installed correctly
+RUN test -x /usr/bin/qvm-remote
+RUN test -x /usr/bin/qvm-remote-dom0
+RUN qvm-remote --version
+RUN qvm-remote-dom0 --version
+
+# Copy install script and test script
+COPY --from=builder /build/install/install-dom0.sh /tmp/install-dom0.sh
+COPY test/dom0-sim/test-dom0-sim.sh /tmp/test-dom0-sim.sh
+RUN chmod +x /tmp/test-dom0-sim.sh
+
+# Create log directory (normally created by systemd RuntimeDirectory)
+RUN mkdir -p /var/log/qubes /var/run/qvm-remote
+RUN chmod 700 /var/run/qvm-remote
+
+# Run the full test suite
+RUN /tmp/test-dom0-sim.sh

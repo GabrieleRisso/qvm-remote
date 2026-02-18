@@ -1,0 +1,3 @@
+#!/bin/bash
+# mock-hostname -- always returns "dom0" for install script testing
+echo "dom0"

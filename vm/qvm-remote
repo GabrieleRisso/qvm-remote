@@ -1,0 +1,423 @@
+#!/usr/bin/python3
+# qvm-remote -- execute commands in Qubes OS dom0 from a VM
+#
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Execute commands in Qubes OS dom0 from this VM.
+
+Analogous to ssh(1): ``qvm-remote COMMAND`` runs COMMAND in dom0.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac as _hmac
+import os
+import secrets
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import NoReturn
+
+VERSION = "1.0.0"
+PROGNAME = "qvm-remote"
+
+DATA_DIR = Path.home() / ".qvm-remote"
+QUEUE_DIR = DATA_DIR / "queue"
+HISTORY_DIR = DATA_DIR / "history"
+LOG_FILE = DATA_DIR / "audit.log"
+KEY_FILE = DATA_DIR / "auth.key"
+MAX_CMD_SIZE = 1 << 20  # 1 MiB
+DEFAULT_TIMEOUT = 300
+
+USAGE = """\
+usage: qvm-remote [-t SEC] [-v] [-q] COMMAND [ARGS ...]
+       COMMAND | qvm-remote
+       qvm-remote < script.sh
+
+Execute commands in Qubes OS dom0 from this VM.
+
+options:
+  -t, --timeout SEC    execution timeout (default: 300)
+  -v, --verbose        increase verbosity
+  -q, --quiet          suppress progress output
+  -h, --help           show this help
+  --version            show version
+
+subcommands:
+  key gen              generate a 256-bit auth key
+  key show             print current key
+  key import [KEY]     import a hex key (or stdin)
+  ping                 check dom0 executor status
+  log [N]              show last N audit entries (default: 20)
+  history [N]          show last N commands (default: 10)
+
+examples:
+  qvm-remote qvm-ls
+  qvm-remote 'qvm-prefs work memory 4096'
+  qvm-remote -t 60 'qvm-shutdown --wait work'
+  echo 'xl info' | qvm-remote
+
+key setup (one-time):
+  qvm-remote key gen                  generate and store key
+  qvm-remote key show                 show key to register in dom0
+  # in dom0: qvm-remote-dom0 authorize VMNAME KEY
+"""
+
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+def die(msg: str, code: int = 1) -> NoReturn:
+    print(f"{PROGNAME}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def hmac_token(key: str, cmd_id: str) -> str:
+    """HMAC-SHA256(key, command_id) -- authenticates each command."""
+    return _hmac.new(
+        key.encode(), cmd_id.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def audit(msg: str) -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        created = not LOG_FILE.exists()
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+        if created:
+            LOG_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def init_dirs() -> None:
+    for d in (
+        QUEUE_DIR / "pending",
+        QUEUE_DIR / "running",
+        QUEUE_DIR / "results",
+        HISTORY_DIR,
+    ):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def write_auth_token(cmd_id: str) -> None:
+    if not KEY_FILE.exists():
+        return
+    key = KEY_FILE.read_text().strip()
+    token = hmac_token(key, cmd_id)
+    (QUEUE_DIR / "pending" / f"{cmd_id}.auth").write_text(token)
+
+
+def gen_id() -> str:
+    return (
+        f"{datetime.now():%Y%m%d-%H%M%S}"
+        f"-{os.getpid()}-{secrets.token_hex(4)}"
+    )
+
+
+def valid_hex_key(key: str) -> bool:
+    if len(key) != 64:
+        return False
+    try:
+        int(key, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def archive(cmd_id: str) -> None:
+    try:
+        day = f"{datetime.now():%Y-%m-%d}"
+        dest = HISTORY_DIR / day / cmd_id
+        dest.mkdir(parents=True, exist_ok=True)
+        for ext in ("out", "err", "exit", "meta", "command"):
+            src = QUEUE_DIR / "results" / f"{cmd_id}.{ext}"
+            if src.exists():
+                src.rename(dest / ext)
+    except OSError:
+        pass
+
+
+def migrate_data_dir() -> None:
+    """One-time migration from qubes-remote to qvm-remote."""
+    old = Path.home() / ".qubes-remote"
+    if old.exists() and not DATA_DIR.exists():
+        try:
+            old.rename(DATA_DIR)
+        except OSError:
+            pass
+
+
+# ── key management ───────────────────────────────────────────────────
+
+def cmd_key_gen() -> int:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        key = os.urandom(32).hex()
+        KEY_FILE.write_text(key)
+        KEY_FILE.chmod(0o600)
+    except OSError as e:
+        die(f"failed to write key: {e}")
+    print(key)
+    host = os.uname().nodename or "VMNAME"
+    print(f"\nKey saved to {KEY_FILE}", file=sys.stderr)
+    print("Register in dom0:", file=sys.stderr)
+    print(f"  qvm-remote-dom0 authorize {host} {key}", file=sys.stderr)
+    return 0
+
+
+def cmd_key_show() -> int:
+    if not KEY_FILE.exists():
+        die(f"no key configured. Run: {PROGNAME} key gen")
+    try:
+        print(KEY_FILE.read_text().strip())
+    except OSError as e:
+        die(f"failed to read key: {e}")
+    return 0
+
+
+def cmd_key_import(args: list[str]) -> int:
+    if args:
+        key = args[0]
+    else:
+        key = sys.stdin.readline()
+    key = key.strip()
+    if not valid_hex_key(key):
+        die("invalid key (expected 64 hex characters)")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        KEY_FILE.write_text(key)
+        KEY_FILE.chmod(0o600)
+    except OSError as e:
+        die(f"failed to import key: {e}")
+    print(f"Key imported to {KEY_FILE}")
+    return 0
+
+
+# ── diagnostics ──────────────────────────────────────────────────────
+
+def cmd_ping() -> int:
+    init_dirs()
+    cid = f"ping-{int(time.time() * 1e9)}-{os.getpid()}"
+    (QUEUE_DIR / "pending" / cid).write_text("true\n")
+    write_auth_token(cid)
+    t0 = time.time()
+    while time.time() - t0 < 10:
+        if (QUEUE_DIR / "results" / f"{cid}.exit").exists():
+            for ext in ("out", "err", "exit", "meta"):
+                (QUEUE_DIR / "results" / f"{cid}.{ext}").unlink(
+                    missing_ok=True
+                )
+            print("qvm-remote-dom0 is responding.")
+            return 0
+        time.sleep(0.5)
+    for p in (
+        QUEUE_DIR / "pending" / cid,
+        QUEUE_DIR / "pending" / f"{cid}.auth",
+    ):
+        p.unlink(missing_ok=True)
+    print("qvm-remote-dom0 is NOT responding.", file=sys.stderr)
+    return 1
+
+
+def cmd_log(args: list[str]) -> int:
+    n = 20
+    if args:
+        if args[0] == "-n" and len(args) > 1 and args[1].isdigit():
+            n = int(args[1])
+        elif args[0].isdigit():
+            n = int(args[0])
+    if not LOG_FILE.exists():
+        print("No audit log entries yet.")
+        return 0
+    for line in LOG_FILE.read_text().splitlines()[-n:]:
+        print(line)
+    return 0
+
+
+def cmd_history(args: list[str]) -> int:
+    n = 10
+    if args:
+        if args[0] == "-n" and len(args) > 1 and args[1].isdigit():
+            n = int(args[1])
+        elif args[0].isdigit():
+            n = int(args[0])
+    if not HISTORY_DIR.exists():
+        print("No command history yet.")
+        return 0
+    dirs = sorted(HISTORY_DIR.glob("*/*"), reverse=True)[:n]
+    if not dirs:
+        print("No command history yet.")
+        return 0
+    print(f"{'ID':<30} {'EXIT':<6} {'DURATION':<10} COMMAND")
+    print(f"{'---':<30} {'----':<6} {'--------':<10} -------")
+    for d in dirs:
+        rc = dur = cmd = "-"
+        if (d / "exit").exists():
+            rc = (d / "exit").read_text().strip()
+        if (d / "meta").exists():
+            for line in (d / "meta").read_text().splitlines():
+                if line.startswith("duration_ms="):
+                    dur = line.split("=", 1)[1] + "ms"
+        if (d / "command").exists():
+            cmd = (d / "command").read_text()[:50].replace("\n", " ")
+        print(f"{d.name:<30} {rc:<6} {dur:<10} {cmd}")
+    return 0
+
+
+# ── command execution ────────────────────────────────────────────────
+
+def cmd_exec(
+    command: list[str],
+    timeout: int,
+    verbose: bool,
+    quiet: bool,
+) -> int:
+    init_dirs()
+    if command:
+        cmd_text = " ".join(command) + "\n"
+    elif not sys.stdin.isatty():
+        cmd_text = sys.stdin.read()
+    else:
+        die("no command specified")
+
+    cmd_bytes = cmd_text.encode()
+    if len(cmd_bytes) == 0:
+        die("empty command")
+    if len(cmd_bytes) > MAX_CMD_SIZE:
+        die(f"command too large ({len(cmd_bytes)} > {MAX_CMD_SIZE} bytes)")
+
+    cid = gen_id()
+    cmd_file = QUEUE_DIR / "pending" / cid
+    cmd_file.write_text(cmd_text)
+    write_auth_token(cid)
+    cmd_copy = Path(str(cmd_file) + ".cmd")
+    cmd_copy.write_text(cmd_text)
+
+    preview = cmd_text[:100].replace("\n", " ")
+    audit(f"SUBMIT id={cid} size={len(cmd_bytes)}B cmd={preview}")
+    if verbose:
+        print(f"[{PROGNAME}] submitted id={cid}", file=sys.stderr)
+
+    # wait for result
+    t0 = time.time()
+    while True:
+        exit_file = QUEUE_DIR / "results" / f"{cid}.exit"
+        if exit_file.exists():
+            break
+        elapsed = time.time() - t0
+        if elapsed >= timeout:
+            audit(f"TIMEOUT id={cid} after={timeout}s")
+            for p in (
+                cmd_file,
+                cmd_copy,
+                QUEUE_DIR / "pending" / f"{cid}.auth",
+                QUEUE_DIR / "running" / cid,
+            ):
+                p.unlink(missing_ok=True)
+            die(f"timed out after {timeout}s (id={cid})", 124)
+        if (
+            not quiet
+            and int(elapsed) > 0
+            and int(elapsed) % 30 == 0
+        ):
+            print(
+                f"[{PROGNAME}] waiting... {int(elapsed)}s/{timeout}s",
+                file=sys.stderr,
+            )
+        time.sleep(0.5)
+
+    # output results
+    out_file = QUEUE_DIR / "results" / f"{cid}.out"
+    err_file = QUEUE_DIR / "results" / f"{cid}.err"
+    if out_file.exists() and out_file.stat().st_size > 0:
+        sys.stdout.buffer.write(out_file.read_bytes())
+    if err_file.exists() and err_file.stat().st_size > 0:
+        sys.stderr.buffer.write(err_file.read_bytes())
+
+    rc = int(exit_file.read_text().strip() or "1")
+    if cmd_copy.exists():
+        cmd_copy.rename(QUEUE_DIR / "results" / f"{cid}.command")
+    audit(f"DONE id={cid} exit={rc}")
+    archive(cid)
+    return rc
+
+
+# ── main ─────────────────────────────────────────────────────────────
+
+def main() -> int:
+    migrate_data_dir()
+
+    timeout = DEFAULT_TIMEOUT
+    verbose = False
+    quiet = False
+    rest: list[str] = []
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(USAGE, end="")
+            return 0
+        if a == "--version":
+            print(f"{PROGNAME} {VERSION}")
+            return 0
+        if a in ("-v", "--verbose"):
+            verbose = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a in ("-t", "--timeout"):
+            if i + 1 >= len(args):
+                die("-t requires a value")
+            timeout = int(args[i + 1])
+            i += 1
+        elif a == "--":
+            rest = args[i + 1:]
+            break
+        elif a.startswith("-"):
+            die(f"unknown option: {a}")
+        else:
+            rest = args[i:]
+            break
+        i += 1
+
+    if not rest:
+        if sys.stdin.isatty():
+            print(USAGE, end="")
+            return 0
+        return cmd_exec([], timeout, verbose, quiet)
+
+    sub = rest[0]
+    if sub == "key":
+        if len(rest) < 2:
+            die("key requires: gen | show | import")
+        act = rest[1]
+        if act == "gen":
+            return cmd_key_gen()
+        if act == "show":
+            return cmd_key_show()
+        if act == "import":
+            return cmd_key_import(rest[2:])
+        die(f"unknown key command: {act}")
+    if sub == "ping":
+        return cmd_ping()
+    if sub == "log":
+        return cmd_log(rest[1:])
+    if sub == "history":
+        return cmd_history(rest[1:])
+
+    return cmd_exec(rest, timeout, verbose, quiet)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(141)

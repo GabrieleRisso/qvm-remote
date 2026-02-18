@@ -1,0 +1,27 @@
+#!/bin/bash
+# Mock qvm-run — simulates Qubes OS qvm-run for dom0 testing.
+#
+# Extracts the VM name and shell command from arguments,
+# then executes the command locally.  When --pass-io is present
+# stdin/stdout/stderr pass through (simulating qrexec I/O).
+
+VM=""
+CMD=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pass-io|--no-gui|--no-autostart) shift ;;
+        -*)                                 shift ;;
+        *)
+            if [[ -z "$VM" ]]; then
+                VM="$1"
+            else
+                CMD="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$CMD" ]] || exit 1
+exec bash -c "$CMD"

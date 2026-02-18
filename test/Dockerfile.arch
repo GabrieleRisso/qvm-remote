@@ -1,0 +1,39 @@
+# Dockerfile.arch -- Arch Linux client integration test.
+#
+# Installs qvm-remote client via make install-vm in an Arch Linux
+# container and runs the full client test suite.
+#
+# Build:
+#   podman build -f test/Dockerfile.arch -t qvm-remote-arch-test .
+#
+# Tests cover:
+#   - Binary installation and shebang verification
+#   - CLI help, version, error handling
+#   - Key generation, import, show cycle
+#   - Key and audit log file permissions (0600)
+#   - Data migration (.qubes-remote -> .qvm-remote)
+#   - Python 3.8+ compatibility
+#   - Source hardening verification (secrets, error handling)
+
+FROM archlinux:latest
+
+RUN pacman -Syu --noconfirm python make
+
+WORKDIR /build
+COPY . /build/
+
+# Syntax check
+RUN python3 -c "import py_compile; py_compile.compile('vm/qvm-remote', doraise=True)"
+
+# Install the VM client
+RUN make install-vm
+
+# Verify installation
+RUN test -x /usr/bin/qvm-remote
+RUN qvm-remote --version
+RUN qvm-remote --help | head -3
+
+# Copy and run the test suite
+COPY test/test-arch-client.sh /tmp/test-arch-client.sh
+RUN chmod +x /tmp/test-arch-client.sh
+RUN /tmp/test-arch-client.sh
