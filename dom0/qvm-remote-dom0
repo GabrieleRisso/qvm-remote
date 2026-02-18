@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -296,9 +297,12 @@ def init_vm_dirs(vm: str) -> None:
 
 
 def list_pending(vm: str) -> list[str]:
-    raw = vm_exec(
-        vm, f"ls -1 {VM_DATA_DIR}/queue/pending/ 2>/dev/null"
+    r = subprocess.run(
+        ["qvm-run", "--no-gui", "--no-autostart", "--pass-io", vm,
+         f"ls -1 {VM_DATA_DIR}/queue/pending/ 2>/dev/null"],
+        capture_output=True, text=True, timeout=10,
     )
+    raw = r.stdout
     return [
         f.strip().replace("\r", "")
         for f in raw.splitlines()
@@ -653,10 +657,48 @@ def main() -> int:
         init_vm_dirs(vm)
     log(f"Listening for commands from: {' '.join(vms)}", "INFO")
 
+    _vm_running_cache: dict[str, float] = {}
+    _VM_CHECK_INTERVAL = 15.0
+    _active_threads: dict[str, threading.Thread] = {}
+    _thread_lock = threading.Lock()
+    MAX_CONCURRENT = 8
+
+    def _process_cmd(vm_name: str, cmd_id_val: str) -> None:
+        try:
+            process(vm_name, cmd_id_val, dry_run=dry_run)
+        except Exception as exc:
+            log(f"vm={vm_name} id={cmd_id_val} {exc}", "ERROR")
+        finally:
+            with _thread_lock:
+                _active_threads.pop(f"{vm_name}:{cmd_id_val}", None)
+
     while _running:
+        with _thread_lock:
+            active_count = len(_active_threads)
+        if active_count >= MAX_CONCURRENT:
+            time.sleep(0.5)
+            continue
+
+        now = time.time()
         for vm in vms:
             if not _running:
                 break
+            cached_at = _vm_running_cache.get(vm, 0)
+            if now - cached_at > _VM_CHECK_INTERVAL:
+                try:
+                    r = subprocess.run(
+                        ["qvm-check", vm, "--running"],
+                        capture_output=True, timeout=5,
+                    )
+                    if r.returncode != 0:
+                        _vm_running_cache[vm] = 0
+                        continue
+                    _vm_running_cache[vm] = now
+                except Exception:
+                    _vm_running_cache[vm] = 0
+                    continue
+            elif cached_at == 0:
+                continue
             try:
                 pending = list_pending(vm)
             except Exception:
@@ -664,14 +706,27 @@ def main() -> int:
             for cmd_id in pending:
                 if not _running:
                     break
-                try:
-                    process(vm, cmd_id, dry_run=dry_run)
-                except Exception as e:
-                    log(f"vm={vm} id={cmd_id} {e}", "ERROR")
+                tkey = f"{vm}:{cmd_id}"
+                with _thread_lock:
+                    if tkey in _active_threads:
+                        continue
+                    if len(_active_threads) >= MAX_CONCURRENT:
+                        break
+                    t = threading.Thread(
+                        target=_process_cmd, args=(vm, cmd_id),
+                        daemon=True, name=tkey,
+                    )
+                    _active_threads[tkey] = t
+                    t.start()
         if run_once:
+            for t in list(_active_threads.values()):
+                t.join(timeout=300)
             log("Single-run mode, exiting.", "INFO")
             break
         time.sleep(1)
+
+    for t in list(_active_threads.values()):
+        t.join(timeout=10)
 
     log(f"Shutting down (pid={os.getpid()})", "INFO")
     shutil.rmtree(WORK_DIR, ignore_errors=True)

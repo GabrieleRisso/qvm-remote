@@ -64,6 +64,9 @@ def _get_managed_vm():
 MANAGED_VM = _get_managed_vm()
 POLICY_FILE = "/etc/qubes/remote-admin-policy.json"
 OPENCLAW_CONF = "/etc/qubes/openclaw.json"
+DEV_MODE_FILE = "/var/run/qvm-remote/dev-mode.json"
+DEV_MODE_DEFAULT_MINUTES = 30
+DEV_MODE_MAX_MINUTES = 120
 
 _vm_list_cache = {"data": None, "ts": 0}
 
@@ -207,6 +210,96 @@ def _policy_error(msg):
     return {"rc": 403, "out": "", "err": msg, "policy_denied": True}
 
 
+# ── Dev mode (temporary elevated permissions) ────────────────────
+
+def _load_dev_mode():
+    """Load dev mode state from runtime file. Returns None if inactive/expired."""
+    try:
+        with open(DEV_MODE_FILE) as f:
+            dm = json.loads(f.read())
+        expires = dm.get("expires_at", 0)
+        if time.time() > expires:
+            _disable_dev_mode()
+            return None
+        return dm
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _enable_dev_mode(minutes=None):
+    """Enable dev mode for N minutes. Stores in /var/run (cleared on reboot)."""
+    if minutes is None:
+        minutes = DEV_MODE_DEFAULT_MINUTES
+    minutes = max(1, min(minutes, DEV_MODE_MAX_MINUTES))
+    now = time.time()
+    dm = {
+        "enabled": True,
+        "activated_at": now,
+        "activated_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "expires_at": now + minutes * 60,
+        "expires_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now + minutes * 60)),
+        "minutes": minutes,
+        "saved_policy": None,
+    }
+    policy = _load_policy()
+    dm["saved_policy"] = dict(policy)
+    try:
+        os.makedirs(os.path.dirname(DEV_MODE_FILE), exist_ok=True)
+        with open(DEV_MODE_FILE, "w") as f:
+            json.dump(dm, f, indent=2)
+        os.chmod(DEV_MODE_FILE, 0o600)
+    except OSError:
+        return None
+    policy["dom0"] = "full"
+    policy["default"] = "full"
+    policy["dom0_read_allowed"] = True
+    _save_policy(policy)
+    return dm
+
+
+def _disable_dev_mode():
+    """Disable dev mode and restore the saved policy."""
+    try:
+        with open(DEV_MODE_FILE) as f:
+            dm = json.loads(f.read())
+        saved = dm.get("saved_policy")
+        if saved and isinstance(saved, dict):
+            _save_policy(saved)
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        os.remove(DEV_MODE_FILE)
+    except OSError:
+        pass
+
+
+def _dev_mode_status():
+    """Return dev mode status dict for API responses."""
+    dm = _load_dev_mode()
+    if dm is None:
+        return {"dev_mode": False}
+    remaining = max(0, dm["expires_at"] - time.time())
+    return {
+        "dev_mode": True,
+        "remaining_seconds": int(remaining),
+        "remaining_human": "{}m {}s".format(int(remaining // 60), int(remaining % 60)),
+        "expires_iso": dm.get("expires_iso", ""),
+        "activated_iso": dm.get("activated_iso", ""),
+        "minutes": dm.get("minutes", 0),
+    }
+
+
+def _check_dev_mode_expiry():
+    """Called on each request to auto-disable expired dev mode."""
+    try:
+        with open(DEV_MODE_FILE) as f:
+            dm = json.loads(f.read())
+        if time.time() > dm.get("expires_at", 0):
+            _disable_dev_mode()
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
 # ── API handlers ─────────────────────────────────────────────────
 
 def api_health(_params):
@@ -214,12 +307,15 @@ def api_health(_params):
     daemon = run(["systemctl", "is-active", "qvm-remote-dom0"], timeout=3)
     web = "active"  # we're running
     vm = run(["qvm-check", MANAGED_VM, "--running"], timeout=3)
+    dm = _dev_mode_status()
     return {
         "daemon": daemon["out"].strip() == "active",
         "web": True,
         "vm": vm["rc"] == 0,
         "vm_name": MANAGED_VM,
         "ts": int(time.time()),
+        "dev_mode": dm.get("dev_mode", False),
+        "dev_remaining": dm.get("remaining_seconds", 0),
     }
 
 
@@ -387,6 +483,54 @@ def api_file_pull(params):
     return r
 
 
+def api_browse(params):
+    """List files/dirs in dom0 or a VM. Returns entries for UI path selectors."""
+    path = params.get("path", "/")
+    vm = params.get("vm", "")
+    show = params.get("show", "all")  # all, dirs, files
+    if not path.startswith("/"):
+        path = "/" + path
+    filt = ""
+    if show == "dirs":
+        filt = " -type d"
+    elif show == "files":
+        filt = " -type f"
+    find_cmd = (
+        "ls -1Ap '{p}' 2>/dev/null | head -80 | while read n; do "
+        "echo '{p}/'\"$n\"; done"
+        .format(p=path.rstrip("/"))
+    )
+    if show == "dirs":
+        find_cmd = (
+            "ls -1Ap '{p}' 2>/dev/null | grep '/$' | head -80 | while read n; do "
+            "echo '{p}/'\"$n\"; done"
+            .format(p=path.rstrip("/"))
+        )
+    elif show == "files":
+        find_cmd = (
+            "ls -1Ap '{p}' 2>/dev/null | grep -v '/$' | head -80 | while read n; do "
+            "echo '{p}/'\"$n\"; done"
+            .format(p=path.rstrip("/"))
+        )
+    if vm:
+        ok, err = _check_perm(vm, "monitor")
+        if not ok:
+            return _policy_error(err)
+        r = run("qvm-run --pass-io --no-gui {} '{}'".format(vm, find_cmd),
+                timeout=10, shell=True)
+    else:
+        if not _check_dom0_read():
+            return _policy_error("dom0 read denied")
+        r = run(find_cmd, timeout=5, shell=True)
+    entries = []
+    if r["rc"] == 0 and r["out"]:
+        for line in r["out"].strip().splitlines():
+            line = line.strip()
+            if line and line != path:
+                entries.append(line)
+    return {"path": path, "entries": entries, "vm": vm}
+
+
 def api_backup_status(_params):
     r = run("ls -lhrt /var/lib/qubes/backup* 2>/dev/null | tail -5; "
             "echo '---'; df -h / | tail -1", timeout=10, shell=True)
@@ -452,19 +596,24 @@ def api_openclaw_control(params):
     action = params.get("action", "")
     if action != "logs" and not _check_dom0_write():
         return _policy_error("dom0 container control denied by policy")
-    eng = "podman" if run(["which", "podman"], timeout=3)["rc"] == 0 else "docker"
+    podman_ok = run(["which", "podman"], timeout=3)["rc"] == 0
+    docker_ok = run(["which", "docker"], timeout=3)["rc"] == 0 if not podman_ok else False
+    if not podman_ok and not docker_ok:
+        return {"error": "No container engine (podman/docker) found in dom0. "
+                "OpenClaw typically runs inside VMs. Use the VM Container Controls section below.",
+                "hint": "vm_controls", "out": ""}
+    eng = "podman" if podman_ok else "docker"
     cfg = _load_openclaw_config()
-    # Pre-check: does compose work in dom0?
     test = run("{} compose version".format(eng), timeout=5, shell=True)
     if test["rc"] != 0:
-        return {"error": "No container engine with compose support found in dom0. "
-                "OpenClaw likely runs in VMs -- use VM Container Controls instead.",
-                "hint": "vm_controls"}
+        return {"error": "{} is installed but 'compose' plugin is missing. "
+                "Install it or use VM Container Controls instead.".format(eng),
+                "hint": "vm_controls", "out": ""}
     chk = run("{} compose config --quiet".format(eng), timeout=5, shell=True)
     if chk["rc"] != 0:
-        return {"error": "No compose file found in dom0 working directory. "
+        return {"error": "No docker-compose.yml found in dom0. "
                 "OpenClaw runs in VMs, not dom0. Use VM Container Controls below.",
-                "hint": "vm_controls"}
+                "hint": "vm_controls", "out": ""}
     t = cfg.get("timeouts", {})
     if action == "start":
         r = run("{} compose up -d".format(eng), timeout=t.get("start", 120), shell=True)
@@ -502,27 +651,27 @@ def api_openclaw_vm(params):
     elif action == "start":
         r = run("qvm-run --pass-io --no-gui {} '"
                 "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
-                "eng=$(command -v podman || command -v docker); "
-                "$eng compose up -d 2>&1 || "
-                "(systemctl --user start openclaw-cursor-proxy 2>/dev/null; "
-                "systemctl --user start openclaw-gateway 2>/dev/null); "
+                "eng=$(command -v podman 2>/dev/null || command -v docker 2>/dev/null || true); "
+                "if [ -n \"$eng\" ]; then $eng compose up -d 2>&1; "
+                "else systemctl --user start openclaw-cursor-proxy 2>/dev/null; "
+                "systemctl --user start openclaw-gateway 2>/dev/null; fi; "
                 "echo DONE'".format(vm), timeout=120, shell=True)
         return r
     elif action == "stop":
         r = run("qvm-run --pass-io --no-gui {} '"
                 "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
-                "eng=$(command -v podman || command -v docker); "
-                "$eng compose down 2>&1 || "
-                "(systemctl --user stop openclaw-cursor-proxy 2>/dev/null; "
-                "systemctl --user stop openclaw-gateway 2>/dev/null); "
+                "eng=$(command -v podman 2>/dev/null || command -v docker 2>/dev/null || true); "
+                "if [ -n \"$eng\" ]; then $eng compose down 2>&1; "
+                "else systemctl --user stop openclaw-cursor-proxy 2>/dev/null; "
+                "systemctl --user stop openclaw-gateway 2>/dev/null; fi; "
                 "echo DONE'".format(vm), timeout=60, shell=True)
         return r
     elif action == "logs":
         r = run("qvm-run --pass-io --no-gui {} '"
                 "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
-                "eng=$(command -v podman || command -v docker); "
-                "$eng compose logs --tail 50 2>&1 || "
-                "journalctl --user -u openclaw-cursor-proxy -u openclaw-gateway --no-pager -n 50 2>/dev/null'".format(vm),
+                "eng=$(command -v podman 2>/dev/null || command -v docker 2>/dev/null || true); "
+                "if [ -n \"$eng\" ]; then $eng compose logs --tail 50 2>&1; "
+                "else journalctl --user -u openclaw-cursor-proxy -u openclaw-gateway --no-pager -n 50 2>/dev/null; fi'".format(vm),
                 timeout=15, shell=True)
         return r
     return {"error": "Invalid action"}
@@ -700,7 +849,8 @@ def api_admin_policy(params):
         vm_list = []
         if all_vms["rc"] == 0:
             vm_list = [v.strip() for v in all_vms["out"].strip().splitlines() if v.strip()]
-        return {"policy": policy, "available_vms": vm_list}
+        return {"policy": policy, "available_vms": vm_list,
+                "dev_mode": _dev_mode_status()}
 
     if action == "set_vm":
         vm = params.get("vm", "")
@@ -765,9 +915,24 @@ def api_admin_policy(params):
         return {"error": "Failed to save policy"}
 
     if action == "reset":
+        _disable_dev_mode()
         if _save_policy(dict(DEFAULT_POLICY)):
             return {"ok": True, "policy": DEFAULT_POLICY}
         return {"error": "Failed to reset policy"}
+
+    if action == "enable_dev":
+        minutes = int(params.get("minutes", DEV_MODE_DEFAULT_MINUTES))
+        dm = _enable_dev_mode(minutes)
+        if dm:
+            return {"ok": True, "dev_mode": _dev_mode_status()}
+        return {"error": "Failed to enable dev mode"}
+
+    if action == "disable_dev":
+        _disable_dev_mode()
+        return {"ok": True, "dev_mode": _dev_mode_status(), "policy": _load_policy()}
+
+    if action == "dev_status":
+        return _dev_mode_status()
 
     return {"error": "Invalid action"}
 
@@ -1280,6 +1445,7 @@ ROUTES = {
     "/api/vm/prefs": api_vm_prefs,
     "/api/file/push": api_file_push,
     "/api/file/pull": api_file_pull,
+    "/api/browse": api_browse,
     "/api/backup/status": api_backup_status,
     "/api/backup/start": api_backup_start,
     "/api/log": api_log,
@@ -1340,6 +1506,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
     def do_GET(self):
+        _check_dev_mode_expiry()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/" or parsed.path == "/index.html":
             self.send_response(200)
@@ -1365,6 +1532,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        _check_dev_mode_expiry()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ROUTES:
             length = int(self.headers.get("Content-Length", 0))
@@ -1696,6 +1864,11 @@ input:focus, textarea:focus { border-color: var(--blue); outline: none; }
 .log-colored .log-ts { color: #7f8c8d; }
 .log-colored .log-highlight { background: #fff3cd; }
 
+/* Inline hints */
+.hint { font-size: 11px; color: var(--soft); line-height: 1.4; margin: 2px 0 4px; }
+.hint code { background: #eee; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+.hint b { color: var(--text); font-weight: 600; }
+
 /* Row layout */
 .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
 .row label { font-weight: 500; white-space: nowrap; min-width: 100px; }
@@ -1751,6 +1924,7 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
   <span id="conn-text">Checking connection...</span>
   <span class="vm" id="conn-vm">VM: """ + MANAGED_VM + r"""</span>
   <button onclick="refreshAll()" title="Refresh all data and VM lists" style="background:none;border:1px solid var(--border);border-radius:4px;cursor:pointer;padding:2px 8px;font-size:12px;color:var(--fg);margin-left:8px">&#x21bb; Refresh</button>
+  <span id="dev-mode-badge" style="display:none;margin-left:8px;background:#e67e22;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer" onclick="switchTab('policy')" title="Dev mode active — click to manage">DEV <span id="dev-badge-timer"></span></span>
   <span id="global-spinner" style="display:none;margin-left:6px" title="Loading...">
     <svg width="16" height="16" viewBox="0 0 16 16" style="animation:spin 1s linear infinite">
       <circle cx="8" cy="8" r="6" stroke="var(--blue)" stroke-width="2" fill="none" stroke-dasharray="28" stroke-dashoffset="8"/>
@@ -1876,16 +2050,34 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="card-title">Command</div>
         <div class="row">
           <input type="text" id="exec-cmd" placeholder="e.g. qvm-ls --running --fields NAME,CLASS,LABEL,MEM"
-                 title="Shell command to run in dom0. Press Enter or click Execute."
-                 onkeydown="if(event.key==='Enter')doExec()">
+                 title="Shell command to run in dom0. Press Enter or click Execute. Subject to policy enforcement."
+                 onkeydown="if(event.key==='Enter')doExec()" list="exec-cmd-dl">
+          <datalist id="exec-cmd-dl">
+            <option value="qvm-ls --running --fields NAME,CLASS,LABEL,MEM,VCPUS">
+            <option value="qvm-ls --fields NAME,CLASS,LABEL,STATE,NETVM --raw-data">
+            <option value="xl info | grep -E 'total_memory|free_memory|nr_cpus'">
+            <option value="systemctl status qubesd --no-pager">
+            <option value="qubes-dom0-update --check-only">
+            <option value="journalctl -u qvm-remote-dom0 --no-pager -n 30">
+            <option value="qvm-usb list">
+            <option value="qvm-block list">
+            <option value="df -h / | tail -1">
+            <option value="free -h">
+          </datalist>
         </div>
         <div class="row">
-          <button class="btn-primary" onclick="doExec()" title="Execute the command in dom0">Execute</button>
+          <button class="btn-primary" onclick="doExec()" title="Execute the command in dom0 (immediate action, not staged)">Execute</button>
           <label style="min-width:auto" title="Maximum seconds before the command is killed">Timeout:</label>
-          <input type="number" id="exec-timeout" value="300" style="width:80px;flex:none"
-                 title="Increase for long operations (backups, updates)">
-          <span style="font-size:12px">sec</span>
+          <select id="exec-timeout" style="width:100px;flex:none" title="Increase for long operations">
+            <option value="30">30s</option>
+            <option value="60">60s</option>
+            <option value="120">2 min</option>
+            <option value="300" selected>5 min</option>
+            <option value="600">10 min</option>
+            <option value="3600">1 hour</option>
+          </select>
         </div>
+        <span class="hint">Commands are policy-checked. Blocked commands (e.g. <code>qvm-remove dom0</code>) will be rejected. Use the Policy Enforcer tab to configure.</span>
       </div>
 
       <h3>Output</h3>
@@ -1902,7 +2094,19 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label style="min-width:auto"><input type="checkbox" id="vmrun-dispvm"> DispVM</label>
         </div>
         <div class="row">
-          <input type="text" id="vmrun-cmd" placeholder="e.g. uname -a" title="Command to run in the VM" onkeydown="if(event.key==='Enter')doVmRun()">
+          <input type="text" id="vmrun-cmd" placeholder="e.g. uname -a" title="Command to run inside the VM. Press Enter to execute." onkeydown="if(event.key==='Enter')doVmRun()" list="vmrun-cmd-dl">
+          <datalist id="vmrun-cmd-dl">
+            <option value="uname -a">
+            <option value="hostname && whoami">
+            <option value="df -h / | tail -1">
+            <option value="free -h">
+            <option value="cat /etc/os-release | head -3">
+            <option value="qvm-remote --version">
+            <option value="qvm-remote ping">
+            <option value="cat ~/.qvm-remote/auth.key">
+            <option value="systemctl --user list-units --state=running">
+            <option value="ls -la /home/user/">
+          </datalist>
         </div>
         <div class="row" style="flex-wrap:wrap;gap:8px">
           <label style="min-width:auto" title="Pass stdin/stdout/stderr"><input type="checkbox" id="vmrun-passio" checked> --pass-io</label>
@@ -1912,8 +2116,13 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label style="min-width:auto" title="Run as user">--user:</label>
           <input type="text" id="vmrun-user" placeholder="(default)" style="width:100px;flex:none" title="Run command as this user">
           <label style="min-width:auto">Timeout:</label>
-          <input type="number" id="vmrun-timeout" value="120" style="width:70px;flex:none">
-          <span style="font-size:12px">sec</span>
+          <select id="vmrun-timeout" style="width:90px;flex:none" title="Maximum seconds for the command">
+            <option value="30">30s</option>
+            <option value="60">60s</option>
+            <option value="120" selected>2 min</option>
+            <option value="300">5 min</option>
+            <option value="600">10 min</option>
+          </select>
         </div>
         <div class="row" style="margin-top:6px">
           <button class="btn-primary" onclick="doVmRun()" title="Execute command in the selected VM">Run in VM</button>
@@ -1951,12 +2160,17 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="row">
           <label title="The Qubes VM name (e.g. work, personal)">VM name:</label>
           <select id="auth-vm" class="vm-selector" style="width:180px" title="Name of the VM to authorize"></select>
+          <button onclick="fetchKeyFromVm('auth')" title="Auto-fetch the key from the selected VM (must be running with qvm-remote installed)" style="font-size:11px">Fetch Key from VM</button>
         </div>
         <div class="row">
           <label title="64-character hex key from 'qvm-remote key show'">Key:</label>
-          <input type="text" id="auth-key" placeholder="64-character hex key"
-                 title="Paste the 64-char hex key generated by 'qvm-remote key gen' in the VM">
-          <button class="btn-primary" onclick="authorizeVm()" title="Register this VM+key pair">Authorize</button>
+          <input type="text" id="auth-key" placeholder="e.g. a1b2c3d4e5f6...  (64 hex chars from 'qvm-remote key show')"
+                 title="Paste the 64-char hex key generated by 'qvm-remote key gen' in the VM" style="font-family:monospace;font-size:11px">
+          <button onclick="generateLocalKey('auth-key')" title="Generate a random 256-bit hex key (for manual setup)" style="font-size:11px">Generate</button>
+        </div>
+        <div class="row">
+          <button class="btn-primary" onclick="authorizeVm()" title="Register this VM+key pair in dom0">Authorize</button>
+          <span class="hint">Tip: use <b>Connect VM</b> below for a fully automated one-step setup.</span>
         </div>
       </div>
 
@@ -1973,14 +2187,19 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="row">
           <label title="VM name to connect">VM:</label>
           <select id="conn-vm-name" class="vm-selector" style="width:180px" title="Name of the VM to connect/disconnect"></select>
-          <label title="Optional: hex key (auto-fetched if empty)" style="min-width:auto">Key:</label>
-          <input type="text" id="conn-vm-key" placeholder="(auto-fetch from VM)" title="64-char hex key. Leave empty to auto-fetch from the VM.">
         </div>
         <div class="row">
-          <button class="btn-primary" onclick="connectVm()" title="Authorize + add to config + init VM dirs">Connect</button>
+          <label title="Optional: hex key (auto-fetched if empty)" style="min-width:auto">Key (optional):</label>
+          <input type="text" id="conn-vm-key" placeholder="Leave empty = auto-fetch from VM" title="64-char hex key. Leave empty to auto-fetch from the running VM." style="font-family:monospace;font-size:11px">
+          <button onclick="generateLocalKey('conn-vm-key')" title="Generate a random 256-bit hex key" style="font-size:11px">Generate</button>
+          <button onclick="fetchKeyFromVm('conn')" title="Fetch existing key from the selected VM" style="font-size:11px">Fetch</button>
+        </div>
+        <div class="row">
+          <button class="btn-primary" onclick="connectVm()" title="Full setup: install client if missing, generate key if needed, authorize, add to config, init dirs, test">Connect</button>
           <button class="btn-danger" onclick="if(confirm('Disconnect this VM? Its key will be revoked and queue cleaned.'))disconnectVm()" title="Revoke key + remove from config + clean queue">Disconnect</button>
           <button onclick="loadDaemonStatus()" title="Show full daemon status report">Daemon Status</button>
         </div>
+        <span class="hint">Leave the key field empty for fully automatic setup. The VM must be running.</span>
         <div class="output" id="conn-output" style="max-height:200px;min-height:60px"></div>
       </div>
 
@@ -2042,12 +2261,29 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <select id="push-vm" class="vm-selector" style="width:180px" title="Destination VM name"></select>
         </div>
         <div class="row">
-          <label title="Path to the file in dom0">Dom0 path:</label>
-          <input type="text" id="push-src" placeholder="/tmp/file" title="Source file in dom0">
-          <label title="Destination path inside the VM" style="min-width:auto">VM path:</label>
-          <input type="text" id="push-dst" placeholder="/tmp/file" title="Where to write in the VM">
-          <button class="btn-primary" onclick="filePush()" title="Send the file">Push</button>
+          <label title="Source file in dom0">Dom0 file:</label>
+          <select id="push-src" style="width:260px" title="Select a source file from dom0">
+            <option value="">(select or browse)</option>
+            <option value="/tmp/">/tmp/</option>
+            <option value="/etc/qubes/remote.conf">/etc/qubes/remote.conf</option>
+            <option value="/etc/qubes/remote-admin-policy.json">/etc/qubes/remote-admin-policy.json</option>
+          </select>
+          <button onclick="browsePath('push-src','','/tmp','files')" title="Browse dom0 /tmp" style="font-size:11px">Browse /tmp</button>
+          <button onclick="browsePath('push-src','','/etc/qubes','files')" title="Browse /etc/qubes" style="font-size:11px">/etc/qubes</button>
         </div>
+        <div class="row">
+          <label title="Where to save in the VM">VM destination:</label>
+          <select id="push-dst" style="width:260px" title="Destination path in the VM">
+            <option value="">(select or browse)</option>
+            <option value="/home/user/">/home/user/</option>
+            <option value="/tmp/">/tmp/</option>
+            <option value="/home/user/.config/">/home/user/.config/</option>
+            <option value="/usr/local/bin/">/usr/local/bin/</option>
+          </select>
+          <button onclick="browsePath('push-dst',document.getElementById('push-vm').value,'/home/user','all')" title="Browse the VM home dir" style="font-size:11px">Browse VM</button>
+          <button class="btn-primary" onclick="filePush()" title="Send the file now (immediate action)">Push</button>
+        </div>
+        <span class="hint">Select a dom0 file and a VM destination. Use Browse to navigate directories.</span>
       </div>
 
       <div class="card">
@@ -2055,14 +2291,31 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="row">
           <label title="VM containing the file">Source VM:</label>
           <select id="pull-vm" class="vm-selector" style="width:180px" title="Source VM name"></select>
-          <label title="Path inside the VM" style="min-width:auto">VM path:</label>
-          <input type="text" id="pull-src" placeholder="/path/in/vm" title="File to pull from the VM">
+        </div>
+        <div class="row">
+          <label title="File inside the VM">VM file:</label>
+          <select id="pull-src" style="width:260px" title="Select the file to pull from the VM">
+            <option value="">(select or browse)</option>
+            <option value="/home/user/">/home/user/</option>
+            <option value="/tmp/">/tmp/</option>
+            <option value="/home/user/.qvm-remote/auth.key">/home/user/.qvm-remote/auth.key</option>
+          </select>
+          <button onclick="browsePath('pull-src',document.getElementById('pull-vm').value,'/home/user','all')" title="Browse the VM home dir" style="font-size:11px">Browse VM</button>
+          <button onclick="browsePath('pull-src',document.getElementById('pull-vm').value,'/tmp','all')" title="Browse /tmp in VM" style="font-size:11px">/tmp</button>
         </div>
         <div class="row">
           <label title="Where to save in dom0">Dom0 dest:</label>
-          <input type="text" id="pull-dst" placeholder="/tmp/" title="Destination in dom0">
+          <select id="pull-dst" style="width:260px" title="Where to save the file in dom0">
+            <option value="">(select or browse)</option>
+            <option value="/tmp/" selected>/tmp/</option>
+            <option value="/home/">/home/</option>
+            <option value="/etc/qubes/">/etc/qubes/</option>
+            <option value="/var/tmp/">/var/tmp/</option>
+          </select>
+          <button onclick="browsePath('pull-dst','','/tmp','dirs')" title="Browse dom0 directories" style="font-size:11px">Browse /tmp</button>
           <button class="btn-primary" onclick="filePull()" title="Fetch the file">Pull</button>
         </div>
+        <span class="hint">Select a VM, browse for the source file, then choose where to save in dom0.</span>
       </div>
       <div class="output" id="file-output" style="min-height:60px"></div>
     </div>
@@ -2086,11 +2339,18 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
       <div class="card">
         <div class="row">
           <label title="Directory or device for the backup">Destination:</label>
-          <input type="text" id="bak-dest" value="/mnt/backup/" title="Path in dom0">
-          <button onclick="checkBackup()" title="List existing backups and check disk space">Check</button>
-          <button class="btn-primary" onclick="if(confirm('Start full Qubes backup? This may take hours.'))startBackup()"
-                  title="Begin a full backup">Start Backup</button>
+          <select id="bak-dest" style="width:260px" title="Select where to store the backup. Connect USB storage first if needed.">
+            <option value="/mnt/backup/">/mnt/backup/</option>
+            <option value="/mnt/usb/">/mnt/usb/</option>
+            <option value="/var/lib/qubes/backup/">/var/lib/qubes/backup/</option>
+            <option value="/tmp/">/tmp/ (testing only)</option>
+          </select>
+          <button onclick="browsePath('bak-dest','','/mnt','dirs')" title="Browse /mnt for mount points" style="font-size:11px">Browse /mnt</button>
+          <button onclick="checkBackup()" title="List existing backups and check disk space at the destination">Check Space</button>
+          <button class="btn-primary" onclick="if(confirm('Start full Qubes backup to ' + document.getElementById('bak-dest').value + '? This may take hours for large VMs.'))startBackup()"
+                  title="Begin a full backup (all VMs with include_in_backups=True)">Start Backup</button>
         </div>
+        <span class="hint">Backs up all VMs with <code>include_in_backups=True</code>. Mount your USB drive to <code>/mnt/usb</code> first if using external storage.</span>
       </div>
       <div class="output" id="bak-output" style="min-height:80px"></div>
     </div>
@@ -2274,13 +2534,20 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
       <div class="card">
         <div class="row">
           <label title="Container name">Container:</label>
-          <input type="text" id="clog-name" placeholder="openclaw-cursor-proxy" title="Container name (e.g. openclaw-cursor-proxy)">
+          <input type="text" id="clog-name" placeholder="e.g. openclaw-cursor-proxy" title="Container name" list="clog-name-dl">
+          <datalist id="clog-name-dl">
+            <option value="openclaw-cursor-proxy">
+            <option value="openclaw-gateway">
+          </datalist>
           <label style="min-width:auto" title="If in a VM, enter name">VM:</label>
           <select id="clog-vm" class="vm-selector" style="width:180px" title="Leave empty for dom0 containers, or select VM name"><option value="">(dom0)</option></select>
           <label style="min-width:auto">Lines:</label>
-          <input type="number" id="clog-lines" value="50" style="width:60px;flex:none">
-          <button class="btn-primary" onclick="getContainerLogs()" title="Fetch logs">Get Logs</button>
+          <select id="clog-lines" style="width:70px;flex:none" title="Number of log lines">
+            <option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option>
+          </select>
+          <button class="btn-primary" onclick="getContainerLogs()" title="Fetch logs from the container">Get Logs</button>
         </div>
+        <span class="hint">Select a VM to view container logs from that VM, or leave as (dom0) for dom0 containers.</span>
         <div class="output" id="clog-output" style="max-height:250px"></div>
       </div>
 
@@ -2303,9 +2570,14 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label style="min-width:auto">Gateway port:</label>
           <input type="number" id="oc-gw-port" value="18789" style="width:80px;flex:none" title="OpenClaw gateway port">
         </div>
-        <div class="row" style="margin-top:6px">
-          <label style="min-width:auto">Compose paths (comma-separated):</label>
-          <input type="text" id="oc-paths" value="~/qubes-claw/openclaw, ~/openclaw-cursor" title="Search paths for docker-compose files">
+        <div class="row" style="margin-top:6px;flex-wrap:wrap;gap:8px">
+          <label style="min-width:auto">Compose paths:</label>
+          <select id="oc-paths" style="width:260px" title="Select which compose project directory to use" multiple size="2">
+            <option value="~/qubes-claw/openclaw" selected>~/qubes-claw/openclaw</option>
+            <option value="~/openclaw-cursor" selected>~/openclaw-cursor</option>
+            <option value="~/docker/openclaw">~/docker/openclaw</option>
+            <option value="/opt/openclaw">/opt/openclaw</option>
+          </select>
         </div>
         <div class="row" style="margin-top:6px">
           <button class="btn-primary" onclick="saveOcConfig()" title="Save OpenClaw configuration">Save Config</button>
@@ -2345,11 +2617,13 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         <div class="card-title">Edit Preference</div>
         <div class="row">
           <label title="Preference name (e.g. default_netvm)">Property:</label>
-          <select id="gp-prop" title="qubes-prefs property name" style="width:180px"><option value="">(select property)</option><option value="clockvm">clockvm</option><option value="default_template">default_template</option><option value="default_fw_netvm">default_fw_netvm</option><option value="default_netvm">default_netvm</option><option value="default_kernel">default_kernel</option><option value="default_pool">default_pool</option><option value="updatevm">updatevm</option></select>
+          <select id="gp-prop" title="qubes-prefs property name" style="width:180px" onchange="populateValDatalist('gp-prop','gp-val-dl')"><option value="">(select property)</option><option value="clockvm">clockvm</option><option value="default_template">default_template</option><option value="default_fw_netvm">default_fw_netvm</option><option value="default_netvm">default_netvm</option><option value="default_kernel">default_kernel</option><option value="default_pool">default_pool</option><option value="updatevm">updatevm</option></select>
           <label title="New value" style="min-width:auto">Value:</label>
-          <input type="text" id="gp-val" placeholder="sys-firewall" title="New value for the property">
-          <button class="btn-primary" onclick="setGlobalPref()" title="Apply the preference change">Set</button>
+          <input type="text" id="gp-val" placeholder="e.g. sys-firewall, fedora-42-xfce" title="New value for the property. Use VM names for clockvm/updatevm, template names for default_template." list="gp-val-dl">
+          <datalist id="gp-val-dl"></datalist>
+          <button class="btn-primary" onclick="setGlobalPref()" title="Stage change (apply with the Apply button at the bottom)">Set</button>
         </div>
+        <span class="hint">Changes are staged. Click <b>Apply</b> at the bottom bar to save. Use the current values table above as reference.</span>
       </div>
 
       <h3>VM Preferences</h3>
@@ -2361,11 +2635,19 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         </div>
         <div class="row">
           <label title="Property to set">Prop:</label>
-          <select id="vp-prop" title="Property name (e.g. memory, vcpus, netvm)" style="width:180px"><option value="">(select property)</option><option>autostart</option><option>debug</option><option>default_dispvm</option><option>default_user</option><option>include_in_backups</option><option>ip</option><option>kernel</option><option>kernelopts</option><option>label</option><option>mac</option><option>maxmem</option><option>memory</option><option>netvm</option><option>provides_network</option><option>qrexec_timeout</option><option>template</option><option>template_for_dispvms</option><option>vcpus</option><option>virt_mode</option></select>
+          <select id="vp-prop" title="Property name (e.g. memory, vcpus, netvm)" style="width:180px" onchange="populateValDatalist('vp-prop','vp-val-dl')"><option value="">(select property)</option><option>autostart</option><option>debug</option><option>default_dispvm</option><option>default_user</option><option>include_in_backups</option><option>ip</option><option>kernel</option><option>kernelopts</option><option>label</option><option>mac</option><option>maxmem</option><option>memory</option><option>netvm</option><option>provides_network</option><option>qrexec_timeout</option><option>template</option><option>template_for_dispvms</option><option>vcpus</option><option>virt_mode</option></select>
           <label style="min-width:auto">Value:</label>
-          <input type="text" id="vp-val" placeholder="4096" title="New value">
-          <button class="btn-primary" onclick="setVmPref()" title="Set the property value">Set</button>
+          <input type="text" id="vp-val" placeholder="e.g. 4096, sys-firewall, True, red" title="Value depends on property: number for memory/vcpus, VM name for netvm, True/False for booleans, color for label" list="vp-val-dl">
+          <datalist id="vp-val-dl">
+            <option value="True"><option value="False">
+            <option value="1024"><option value="2048"><option value="4096"><option value="8192">
+            <option value="1"><option value="2"><option value="4"><option value="8">
+            <option value="red"><option value="orange"><option value="yellow"><option value="green"><option value="gray"><option value="blue"><option value="purple"><option value="black">
+            <option value="hvm"><option value="pvh"><option value="pv">
+          </datalist>
+          <button class="btn-primary" onclick="setVmPref()" title="Stage the preference change (apply with the Apply button)">Set</button>
         </div>
+        <span class="hint">memory/maxmem in MiB, vcpus as integer, label as color name, virt_mode as hvm/pvh/pv. Changes are staged.</span>
         <div class="output" id="vp-output" style="max-height:200px"></div>
       </div>
 
@@ -2388,6 +2670,16 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <button class="btn-danger" onclick="if(confirm('Apply dom0 updates? This may reboot Xen.'))dom0Update('update')" title="Download and install updates">Apply Updates</button>
         </div>
         <div class="output" id="upd-output" style="max-height:150px"></div>
+      </div>
+
+      <div class="card" style="background:#fff3cd;border:1px solid #ffc107;margin-top:16px">
+        <div class="row" style="align-items:center;justify-content:space-between">
+          <span style="font-weight:600;font-size:13px">Staged changes for Global Config &amp; VM Prefs</span>
+          <div style="display:flex;gap:8px">
+            <button class="btn-primary" onclick="applyTabChanges('global_prefs');applyTabChanges('vm_prefs')" title="Apply all staged global and VM preference changes now">Apply Config Changes</button>
+            <button onclick="discardTabChanges('global_prefs','vm_prefs')" title="Discard staged changes for this tab">Discard</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2417,9 +2709,18 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         </div>
         <div class="row">
           <label>Add rule:</label>
-          <input type="text" id="fw-rule" placeholder="accept proto=tcp dstports=443" title="Rule: action [opts] e.g. 'accept dsthost=10.0.0.0/8'">
-          <button class="btn-primary" onclick="addFirewallRule()" title="Add the rule">Add</button>
+          <input type="text" id="fw-rule" placeholder="e.g. accept proto=tcp dstports=443" title="Format: ACTION [proto=tcp|udp|icmp] [dstports=N[-M]] [dsthost=IP] [expire=+SEC]" list="fw-rule-dl">
+          <datalist id="fw-rule-dl">
+            <option value="accept proto=tcp dstports=443">Allow HTTPS outbound
+            <option value="accept proto=tcp dstports=80">Allow HTTP outbound
+            <option value="accept proto=tcp dstports=22">Allow SSH
+            <option value="accept dsthost=10.0.0.0/8">Allow LAN
+            <option value="accept dsthost=192.168.0.0/16">Allow private network
+            <option value="drop">Block all remaining traffic
+          </datalist>
+          <button class="btn-primary" onclick="addFirewallRule()" title="Stage the rule (apply with Apply button)">Add</button>
         </div>
+        <span class="hint">Rules staged until Apply. Format: <code>accept|drop [proto=tcp|udp|icmp] [dstports=N-M] [dsthost=IP/MASK] [expire=+SEC]</code></span>
         <div class="output" id="fw-output" style="max-height:200px"></div>
       </div>
 
@@ -2444,10 +2745,12 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label>VM:</label>
           <select id="dev-ctl-vm" class="vm-selector" style="width:180px" title="VM for attach/detach"></select>
           <label style="min-width:auto">Port:</label>
-          <input type="text" id="dev-ctl-port" placeholder="sys-usb:2-1" title="Backend:port identifier">
-          <button class="btn-primary" onclick="deviceCtl('attach')" title="Attach device to VM">Attach</button>
+          <input type="text" id="dev-ctl-port" placeholder="e.g. sys-usb:2-1" title="Backend:port_id from the list above. Click USB/PCI/Block first to see available devices." list="dev-port-dl">
+          <datalist id="dev-port-dl"></datalist>
+          <button class="btn-primary" onclick="deviceCtl('attach')" title="Attach device to VM (immediate action)">Attach</button>
           <button class="btn-danger" onclick="deviceCtl('detach')" title="Detach device from VM">Detach</button>
         </div>
+        <span class="hint">Click USB/PCI/Block above first to see available devices, then copy the port identifier.</span>
         <div class="output" id="dev-ctl-output" style="max-height:200px"></div>
       </div>
 
@@ -2462,8 +2765,9 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <datalist id="feat-name-dl"><option value="gui"><option value="gui-default-allow-utf8-titles"><option value="internal"><option value="os-distribution"><option value="os-eol"><option value="os-version"><option value="qrexec"><option value="servicevm"><option value="supported-service.qubes-update-check"><option value="updates-available"></datalist>
           <label style="min-width:auto">Value:</label>
           <input type="text" id="feat-val" placeholder="1" title="Feature value">
-          <button class="btn-primary" onclick="setFeature()" title="Set feature value">Set</button>
+          <button class="btn-primary" onclick="setFeature()" title="Stage feature change (apply with Apply button)">Set</button>
         </div>
+        <span class="hint">Changes are staged. Click <b>Apply</b> to save. Common values: <code>1</code> (enabled), <code>0</code> (disabled), or a string.</span>
         <div class="output" id="feat-output" style="max-height:150px"></div>
       </div>
 
@@ -2476,9 +2780,10 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label style="min-width:auto">Tag:</label>
           <input type="text" id="tag-name" list="tag-name-dl" placeholder="my-tag" title="Tag name" style="width:160px">
           <datalist id="tag-name-dl"><option value="audiovm-dom0"><option value="created-by-dom0"><option value="guivm-dom0"><option value="anon-gateway"><option value="anon-workstation"><option value="whonix-updatevm"></datalist>
-          <button class="btn-primary" onclick="modTag('add')" title="Add tag">Add</button>
-          <button class="btn-danger" onclick="modTag('del')" title="Remove tag">Remove</button>
+          <button class="btn-primary" onclick="modTag('add')" title="Stage tag addition (apply with Apply button)">Add</button>
+          <button class="btn-danger" onclick="modTag('del')" title="Stage tag removal">Remove</button>
         </div>
+        <span class="hint">Tags are metadata labels for VMs. Custom tags can be any string. Changes are staged.</span>
         <div class="output" id="tag-output" style="max-height:100px"></div>
       </div>
 
@@ -2491,10 +2796,11 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label style="min-width:auto">Service:</label>
           <input type="text" id="svc-name" list="svc-name-dl" placeholder="qubes-update-check" title="Service name" style="width:180px">
           <datalist id="svc-name-dl"><option value="crond"><option value="cups"><option value="meminfo-writer"><option value="network-manager"><option value="qubes-firewall"><option value="qubes-network"><option value="qubes-update-check"><option value="qubes-updates-proxy"></datalist>
-          <button class="btn-primary" onclick="modService('enable')" title="Enable service">Enable</button>
-          <button class="btn-danger" onclick="modService('disable')" title="Disable service">Disable</button>
-          <button onclick="modService('default')" title="Reset to default">Default</button>
+          <button class="btn-primary" onclick="modService('enable')" title="Stage service enable (apply with Apply button)">Enable</button>
+          <button class="btn-danger" onclick="modService('disable')" title="Stage service disable">Disable</button>
+          <button onclick="modService('default')" title="Reset service to default">Default</button>
         </div>
+        <span class="hint">Services control VM behavior at boot. E.g., <code>qubes-update-check</code> checks for updates. Changes are staged.</span>
         <div class="output" id="svc-output" style="max-height:150px"></div>
       </div>
 
@@ -2517,6 +2823,16 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <button onclick="readPolicy()" title="Read the policy file contents">Read</button>
         </div>
         <div class="output" id="pol-output" style="max-height:200px"></div>
+      </div>
+
+      <div class="card" style="background:#fff3cd;border:1px solid #ffc107;margin-top:16px">
+        <div class="row" style="align-items:center;justify-content:space-between">
+          <span style="font-weight:600;font-size:13px">Staged changes for VM Tools (firewall, features, tags, services)</span>
+          <div style="display:flex;gap:8px">
+            <button class="btn-primary" onclick="applyTabChanges('firewall');applyTabChanges('feature');applyTabChanges('tag');applyTabChanges('service')" title="Apply all staged VM tool changes">Apply VM Tools Changes</button>
+            <button onclick="discardTabChanges('firewall','feature','tag','service')" title="Discard staged changes for this tab">Discard</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -2549,7 +2865,9 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           <label>VM:</label>
           <select id="qr-hist-vm" class="vm-selector" style="width:180px"><option value="">(all VMs)</option></select>
           <label style="min-width:auto">Lines:</label>
-          <input type="number" id="qr-hist-lines" value="50" style="width:60px;flex:none">
+          <select id="qr-hist-lines" style="width:70px;flex:none" title="Number of history entries">
+            <option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option>
+          </select>
           <button onclick="loadCmdHistory()" title="Load command history">Load</button>
         </div>
         <div class="output" id="qr-history" style="max-height:300px"></div>
@@ -2565,6 +2883,35 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
         Assign VMs to permission pools like the Qubes 4.3 device attachment panel: selectively grant
         <em>deny</em>, <em>monitor</em>, <em>manage</em>, or <em>full</em> access per VM.
       </p>
+
+      <!-- Dev mode banner -->
+      <div class="card" id="dev-mode-card" style="display:none;border:2px solid #e67e22;background:#fef9e7">
+        <div class="card-title" style="color:#e67e22" title="Temporary elevated permissions for development. Auto-disables on timeout or reboot.">Development Mode</div>
+        <p style="font-size:12px;margin:0 0 8px;color:#7d6608">
+          Temporarily grants <strong>full</strong> permission to dom0 and all VMs.
+          This is a runtime-only flag stored in <code>/var/run/</code> &mdash; it is <strong>automatically cleared on reboot</strong>
+          and expires after the configured timeout. The original policy is saved and restored when dev mode ends.
+        </p>
+        <div class="row" style="align-items:center;gap:10px">
+          <div id="dev-mode-status" style="font-weight:600;font-size:14px;color:#e67e22"></div>
+          <div id="dev-mode-timer" style="font-family:monospace;font-size:18px;font-weight:700;color:#c0392b;margin-left:8px"></div>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <label title="Duration in minutes (1-120)" style="min-width:auto;font-weight:600">Duration:</label>
+          <select id="dev-mode-minutes" style="width:100px" title="How long dev mode stays active before auto-reverting">
+            <option value="5">5 min</option>
+            <option value="15">15 min</option>
+            <option value="30" selected>30 min</option>
+            <option value="60">1 hour</option>
+            <option value="120">2 hours</option>
+          </select>
+          <button class="btn-danger" id="dev-mode-toggle-btn" onclick="toggleDevMode()" title="Enable or disable dev mode">Enable Dev Mode</button>
+        </div>
+        <span class="hint">
+          <b>Warning:</b> Dev mode bypasses all policy restrictions. The saved policy is restored automatically when it expires or on reboot.
+          Use this only for testing and development.
+        </span>
+      </div>
 
       <!-- dom0 protection -->
       <div class="card">
@@ -2713,6 +3060,16 @@ details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 
           </tbody>
         </table>
       </div>
+
+      <div class="card" style="background:#fff3cd;border:1px solid #ffc107;margin-top:16px">
+        <div class="row" style="align-items:center;justify-content:space-between">
+          <span style="font-weight:600;font-size:13px">Staged policy changes</span>
+          <div style="display:flex;gap:8px">
+            <button class="btn-primary" onclick="applyTabChanges('policy')" title="Apply all staged policy changes now">Apply Policy Changes</button>
+            <button onclick="discardTabChanges('policy')" title="Discard staged policy changes">Discard</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="pending-bar" id="pending-bar">
@@ -2762,7 +3119,30 @@ function _updatePendingBar() {
 function stageChange(key, apiPath, params, label) {
   pendingChanges[key] = {path: apiPath, params, label: label || key};
   _updatePendingBar();
+  showPolicyToast('Staged: ' + (label || key) + '  — click Apply to save');
 }
+async function applyTabChanges(prefix) {
+  const keys = Object.keys(pendingChanges).filter(k => k.startsWith(prefix));
+  if (!keys.length) { showPolicyToast('No pending changes for this section'); return; }
+  if (!confirm('Apply ' + keys.length + ' change(s) for this section?')) return;
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:10000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = '<div style="background:#fff;padding:24px 32px;border-radius:8px;min-width:300px;box-shadow:0 8px 32px rgba(0,0,0,0.3)"><div style="font-weight:600;margin-bottom:12px">Applying...</div><div id="save-progress-tab" style="font-size:12px"></div></div>';
+  document.body.appendChild(overlay);
+  const prog = overlay.querySelector('#save-progress-tab');
+  let ok = 0, fail = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const c = pendingChanges[keys[i]];
+    prog.textContent = (i+1) + '/' + keys.length + ': ' + c.label;
+    const d = await api(c.path, c.params, 'POST');
+    if (d.error || d.policy_denied) { fail++; prog.textContent += ' FAILED'; }
+    else { ok++; delete pendingChanges[keys[i]]; }
+  }
+  prog.innerHTML = '<br><strong>' + ok + ' applied, ' + fail + ' failed</strong>';
+  _updatePendingBar();
+  setTimeout(() => overlay.remove(), fail > 0 ? 3000 : 1200);
+}
+
 async function applyAllChanges() {
   const keys = Object.keys(pendingChanges);
   if (!keys.length) return;
@@ -2783,6 +3163,15 @@ async function applyAllChanges() {
   _updatePendingBar();
   setTimeout(() => overlay.remove(), fail > 0 ? 3000 : 1200);
 }
+function discardTabChanges(...prefixes) {
+  let n = 0;
+  for (const k of Object.keys(pendingChanges)) {
+    if (prefixes.some(p => k.startsWith(p))) { delete pendingChanges[k]; n++; }
+  }
+  _updatePendingBar();
+  if (n) showPolicyToast('Discarded ' + n + ' change(s)');
+}
+
 function discardChanges() {
   for (const k of Object.keys(pendingChanges)) delete pendingChanges[k];
   _updatePendingBar();
@@ -2820,18 +3209,30 @@ async function refreshAll() {
 
 // ── Tab navigation ──
 document.querySelectorAll('.sidebar .tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.sidebar .tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    tab.classList.add('active');
-    const pageId = 'page-' + tab.dataset.page;
-    const pg = document.getElementById(pageId);
-    if (pg) pg.classList.add('active');
-    refreshVmSelectors();
-    const l = typeof tabLoaders !== 'undefined' ? tabLoaders : {};
-    (l[tab.dataset.page] || (()=>{}))();
-  });
+  tab.addEventListener('click', () => switchTab(tab.dataset.page));
 });
+
+function switchTab(page) {
+  document.querySelectorAll('.sidebar .tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const tabEl = document.querySelector('.sidebar .tab[data-page="' + page + '"]');
+  if (tabEl) tabEl.classList.add('active');
+  const pg = document.getElementById('page-' + page);
+  if (pg) pg.classList.add('active');
+  if (location.hash !== '#' + page) history.replaceState(null, '', '#' + page);
+  refreshVmSelectors();
+  const l = typeof tabLoaders !== 'undefined' ? tabLoaders : {};
+  (l[page] || (()=>{}))();
+}
+
+window.addEventListener('hashchange', () => {
+  const h = location.hash.replace('#', '');
+  if (h && document.querySelector('.sidebar .tab[data-page="' + h + '"]')) switchTab(h);
+});
+(function() {
+  const h = location.hash.replace('#', '');
+  if (h && document.querySelector('.sidebar .tab[data-page="' + h + '"]')) switchTab(h);
+})();
 
 // ── API helper ──
 async function api(path, params={}, method='GET') {
@@ -2886,6 +3287,19 @@ async function pollHealth() {
     bar.classList.add('err'); dotEl.className = 'dot d err';
     txt.textContent = 'Service(s) down -- check Dashboard';
   }
+  const devBadge = document.getElementById('dev-mode-badge');
+  if (devBadge) {
+    if (h && h.dev_mode) {
+      devBadge.style.display = '';
+      const bTimer = document.getElementById('dev-badge-timer');
+      if (bTimer && h.dev_remaining > 0) {
+        const m = Math.floor(h.dev_remaining / 60), s = h.dev_remaining % 60;
+        bTimer.textContent = m + ':' + String(s).padStart(2, '0');
+      }
+    } else {
+      devBadge.style.display = 'none';
+    }
+  }
 }
 setInterval(pollHealth, 15000);
 pollHealth();
@@ -2938,13 +3352,14 @@ async function queueAction(action) {
 async function connectVm() {
   const vm = document.getElementById('conn-vm-name').value.trim();
   const key = document.getElementById('conn-vm-key').value.trim();
-  if (!vm) return alert('Enter a VM name');
-  document.getElementById('conn-output').textContent = 'Connecting ' + vm + '...';
+  if (!vm) return alert('Select a VM to connect');
+  if (key && (key.length !== 64 || !/^[0-9a-fA-F]+$/.test(key))) return alert('Key must be exactly 64 hex characters, or leave empty for auto-fetch');
+  document.getElementById('conn-output').textContent = 'Connecting ' + vm + '...\nThis may take 10-30 seconds (installs client, generates key, authorizes).';
   const params = {vm};
   if (key) params.key = key;
   const d = await api('/api/connect', params, 'POST');
   document.getElementById('conn-output').textContent = (d.out||'') + (d.err||'');
-  if (d.rc === 0) { loadVmKeys(); pollHealth(); }
+  if (d.rc === 0) { loadVmKeys(); }
 }
 
 async function disconnectVm() {
@@ -3023,10 +3438,37 @@ async function loadVmKeys() {
   }
 }
 
+function generateLocalKey(fieldId) {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  const hex = Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+  document.getElementById(fieldId).value = hex;
+}
+
+async function fetchKeyFromVm(prefix) {
+  const vmSel = prefix === 'auth' ? 'auth-vm' : 'conn-vm-name';
+  const keyField = prefix === 'auth' ? 'auth-key' : 'conn-vm-key';
+  const vm = document.getElementById(vmSel).value.trim();
+  if (!vm) return alert('Select a VM first');
+  const outEl = prefix === 'conn' ? document.getElementById('conn-output') : document.getElementById('vm-output');
+  if (outEl) outEl.textContent = 'Fetching key from ' + vm + '...';
+  const d = await api('/api/vm-run', {vm, cmd: 'cat ~/.qvm-remote/auth.key 2>/dev/null || echo NO_KEY'}, 'POST');
+  const key = ((d.out || '').trim() || '').replace(/\s/g, '');
+  if (key && key.length === 64 && /^[0-9a-fA-F]+$/.test(key)) {
+    document.getElementById(keyField).value = key;
+    if (outEl) outEl.textContent = 'Key fetched from ' + vm + ' (' + key.substring(0, 8) + '...)';
+  } else if (key === 'NO_KEY') {
+    if (outEl) outEl.textContent = 'No key found in ' + vm + '. Run "qvm-remote key gen" in the VM first.';
+  } else {
+    if (outEl) outEl.textContent = 'Could not fetch key: ' + (d.err || d.out || 'VM not running?');
+  }
+}
+
 async function authorizeVm() {
   const vm = document.getElementById('auth-vm').value.trim();
   const key = document.getElementById('auth-key').value.trim();
-  if (!vm || !key) return alert('Enter both VM name and key');
+  if (!vm || !key) return alert('Select a VM and provide a key (use Generate or Fetch)');
+  if (key.length !== 64 || !/^[0-9a-fA-F]+$/.test(key)) return alert('Key must be exactly 64 hexadecimal characters');
   const d = await api('/api/vm/authorize', {vm, key}, 'POST');
   document.getElementById('vm-output').textContent = (d.out||'') + (d.err||'');
   if (d.rc === 0) { document.getElementById('auth-vm').value = ''; document.getElementById('auth-key').value = ''; loadVmKeys(); }
@@ -3052,6 +3494,34 @@ async function vmCtl(action) {
 }
 
 // ── Files ──
+async function browsePath(targetSelectId, vm, startPath, show) {
+  const sel = document.getElementById(targetSelectId);
+  if (!sel) return;
+  const params = {path: startPath || '/', show: show || 'all'};
+  if (vm) params.vm = vm;
+  const d = await api('/api/browse', params, 'POST');
+  if (d.error || d.policy_denied) {
+    alert(d.err || d.error || 'Browse failed');
+    return;
+  }
+  const entries = d.entries || [];
+  if (!entries.length) {
+    alert('No entries found in ' + (vm ? vm + ':' : 'dom0:') + startPath);
+    return;
+  }
+  const existing = new Set();
+  for (const opt of sel.options) existing.add(opt.value);
+  for (const entry of entries) {
+    if (!existing.has(entry)) {
+      const opt = document.createElement('option');
+      opt.value = entry;
+      opt.textContent = (vm ? vm + ':' : '') + entry;
+      sel.appendChild(opt);
+    }
+  }
+  if (entries.length === 1) sel.value = entries[0];
+}
+
 async function filePush() {
   const vm = document.getElementById('push-vm').value.trim();
   const src = document.getElementById('push-src').value.trim();
@@ -3203,9 +3673,15 @@ async function loadOpenClaw() {
 }
 
 async function ocCtl(action) {
-  document.getElementById('oc-output').textContent = action + 'ing...';
+  const out = document.getElementById('oc-output');
+  out.textContent = action + 'ing...';
   const d = await api('/api/openclaw/control', {action}, 'POST');
-  document.getElementById('oc-output').textContent = (d.out||'') + (d.err||'');
+  if (d.error) {
+    out.textContent = 'Error: ' + d.error;
+    if (d.hint === 'vm_controls') out.textContent += '\n\nTip: Use "VM Container Controls" below to manage OpenClaw inside a VM.';
+  } else {
+    out.textContent = (d.out||'') + (d.err||'');
+  }
   if (action !== 'logs') setTimeout(loadOpenClaw, 2000);
 }
 
@@ -3215,10 +3691,21 @@ async function loadGlobalPrefs() {
   document.getElementById('gp-prefs').textContent = d.out || d.error || 'No data';
 }
 
+function populateValDatalist(propSelId, dlId) {
+  const prop = document.getElementById(propSelId).value;
+  const dl = document.getElementById(dlId);
+  if (!dl) return;
+  const vmProps = ['clockvm','default_template','default_fw_netvm','default_netvm','updatevm','netvm','default_dispvm','template'];
+  if (vmProps.includes(prop)) {
+    dl.innerHTML = _vmListData.map(v => '<option value="' + esc(v.name) + '">').join('');
+  }
+}
+
 async function setGlobalPref() {
   const prop = document.getElementById('gp-prop').value.trim();
   const val = document.getElementById('gp-val').value.trim();
-  if (!prop || !val) return alert('Enter property and value');
+  if (!prop) return alert('Select a property');
+  if (!val) return alert('Enter a value');
   stageChange('global_prefs:' + prop, '/api/qubes-prefs', {prop, val}, 'Global ' + prop + '=' + val);
 }
 
@@ -3277,7 +3764,23 @@ async function addFirewallRule() {
 
 async function loadDevices(type) {
   const d = await api('/api/devices', {type});
-  document.getElementById('dev-ctl-output').textContent = (d.out||'') + (d.error||'');
+  const out = (d.out||'') + (d.error||'');
+  document.getElementById('dev-ctl-output').textContent = out;
+  const dl = document.getElementById('dev-port-dl');
+  if (dl && d.out) {
+    const existing = new Set();
+    for (const opt of dl.options) existing.add(opt.value);
+    for (const line of d.out.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 1 && parts[0].includes(':')) {
+        if (!existing.has(parts[0])) {
+          const opt = document.createElement('option');
+          opt.value = parts[0];
+          dl.appendChild(opt);
+        }
+      }
+    }
+  }
 }
 
 async function deviceCtl(action) {
@@ -3436,6 +3939,7 @@ async function loadAdminPolicy() {
     sel.appendChild(opt);
   }
   document.getElementById('pol-summary').textContent = JSON.stringify(p, null, 2);
+  if (d.dev_mode) updateDevModeUI(d.dev_mode);
 }
 
 async function setDom0Level() {
@@ -3472,12 +3976,80 @@ async function saveBlockedCmds() {
 }
 
 async function resetPolicy() {
-  if (!confirm('Reset ALL policy settings to defaults?')) return;
+  if (!confirm('Reset ALL policy settings to defaults? This also disables dev mode.')) return;
   const d = await api('/api/admin-policy', {action:'reset'}, 'POST');
   if (d.error) alert(d.error);
   loadAdminPolicy();
   for (const k of Object.keys(pendingChanges)) { if (k.startsWith('policy:')) delete pendingChanges[k]; }
   _updatePendingBar();
+  updateDevModeUI(null);
+}
+
+// ── Dev Mode ──
+let _devModeInterval = null;
+
+function updateDevModeUI(dm) {
+  const card = document.getElementById('dev-mode-card');
+  const badge = document.getElementById('dev-mode-badge');
+  const statusEl = document.getElementById('dev-mode-status');
+  const timerEl = document.getElementById('dev-mode-timer');
+  const badgeTimer = document.getElementById('dev-badge-timer');
+  const btn = document.getElementById('dev-mode-toggle-btn');
+  if (!card) return;
+  card.style.display = 'block';
+  if (!dm || !dm.dev_mode) {
+    statusEl.textContent = 'Inactive';
+    statusEl.style.color = '#7d6608';
+    timerEl.textContent = '';
+    if (btn) { btn.textContent = 'Enable Dev Mode'; btn.className = 'btn-danger'; }
+    if (badge) badge.style.display = 'none';
+    if (_devModeInterval) { clearInterval(_devModeInterval); _devModeInterval = null; }
+    return;
+  }
+  statusEl.textContent = 'ACTIVE';
+  statusEl.style.color = '#c0392b';
+  if (btn) { btn.textContent = 'Disable Dev Mode'; btn.className = 'btn-primary'; }
+  if (badge) badge.style.display = '';
+  _devModeCountdown = dm.remaining_seconds || 0;
+  function tick() {
+    if (_devModeCountdown <= 0) {
+      timerEl.textContent = 'Expired — reverting...';
+      if (badgeTimer) badgeTimer.textContent = '';
+      if (badge) badge.style.display = 'none';
+      if (_devModeInterval) { clearInterval(_devModeInterval); _devModeInterval = null; }
+      setTimeout(() => { loadAdminPolicy(); pollHealth(); }, 1500);
+      return;
+    }
+    const m = Math.floor(_devModeCountdown / 60);
+    const s = _devModeCountdown % 60;
+    const txt = m + ':' + String(s).padStart(2, '0');
+    timerEl.textContent = txt + ' remaining';
+    if (badgeTimer) badgeTimer.textContent = txt;
+    _devModeCountdown--;
+  }
+  tick();
+  if (_devModeInterval) clearInterval(_devModeInterval);
+  _devModeInterval = setInterval(tick, 1000);
+}
+
+async function toggleDevMode() {
+  const dm = await api('/api/admin-policy', {action: 'dev_status'}, 'POST');
+  if (dm.dev_mode) {
+    if (!confirm('Disable dev mode? The original policy will be restored.')) return;
+    const d = await api('/api/admin-policy', {action: 'disable_dev'}, 'POST');
+    if (d.error) { alert(d.error); return; }
+    updateDevModeUI(null);
+    showPolicyToast('Dev mode disabled — original policy restored');
+    loadAdminPolicy();
+  } else {
+    const mins = parseInt(document.getElementById('dev-mode-minutes').value) || 30;
+    if (!confirm('Enable dev mode for ' + mins + ' minutes?\n\nThis grants FULL permission to dom0 and all VMs.\nThe current policy is saved and will be restored when dev mode expires or on reboot.')) return;
+    const d = await api('/api/admin-policy', {action: 'enable_dev', minutes: mins}, 'POST');
+    if (d.error) { alert(d.error); return; }
+    updateDevModeUI(d.dev_mode);
+    showPolicyToast('Dev mode enabled for ' + mins + ' minutes');
+    loadAdminPolicy();
+  }
 }
 
 // ── Self-heal ──
@@ -3605,7 +4177,13 @@ async function loadOcConfig() {
   document.getElementById('oc-engine').value = c.engine || 'auto';
   document.getElementById('oc-proxy-port').value = c.proxy_port || 32125;
   document.getElementById('oc-gw-port').value = c.gateway_port || 18789;
-  document.getElementById('oc-paths').value = (c.compose_paths || []).join(', ');
+  const pathSel = document.getElementById('oc-paths');
+  const paths = c.compose_paths || [];
+  for (const p of paths) {
+    let found = false;
+    for (const opt of pathSel.options) { if (opt.value === p) { opt.selected = true; found = true; } }
+    if (!found) { const opt = document.createElement('option'); opt.value = p; opt.textContent = p; opt.selected = true; pathSel.appendChild(opt); }
+  }
 }
 
 async function saveOcConfig() {
@@ -3614,7 +4192,7 @@ async function saveOcConfig() {
     engine: document.getElementById('oc-engine').value,
     proxy_port: parseInt(document.getElementById('oc-proxy-port').value) || 32125,
     gateway_port: parseInt(document.getElementById('oc-gw-port').value) || 18789,
-    compose_paths: document.getElementById('oc-paths').value.split(',').map(s => s.trim()).filter(Boolean),
+    compose_paths: Array.from(document.getElementById('oc-paths').selectedOptions).map(o => o.value),
   };
   const d = await api('/api/openclaw/config', cfg, 'POST');
   if (d.ok) alert('OpenClaw config saved');
