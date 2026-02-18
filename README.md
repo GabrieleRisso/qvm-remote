@@ -188,6 +188,46 @@ Per-VM keys in `/etc/qubes/remote.d/`:
 
 The VM client requires no configuration beyond the key file.
 
+## Web Admin Panel (new in v1.1)
+
+Air-gapped web admin for Qubes OS dom0. Zero external dependencies — pure
+Python stdlib HTTP server on `127.0.0.1:8901`.
+
+```bash
+# Start the web admin in dom0
+sudo make install-webui
+qubes-global-admin-web
+# Open http://127.0.0.1:8901 in dom0 browser
+```
+
+**Features:**
+- Dashboard: daemon status, service control
+- Execute: run dom0 commands via qvm-remote
+- Virtual Machines: authorize/revoke keys, start/stop/pause VMs
+- Files: push/pull between dom0 and VMs
+- Backup: system + config backups
+- Log: daemon log viewer
+- This Device: system hardware info
+- OpenClaw: manage multi-agent AI containers across VMs
+- Global Config: Qubes OS global preferences
+- Advanced: firewall, devices, features, tags, services, policies
+
+All API calls are localhost-only. No internet connectivity required.
+
+## GTK Admin Panel (new in v1.1)
+
+Native GTK admin panel for dom0 with sidebar navigation.
+
+```bash
+# Install GTK admin
+sudo make install-gui2
+
+# Launch from dom0
+qubes-global-admin
+```
+
+Includes desktop entries and systemd service for autostart.
+
 ## GUI (optional)
 
 GTK3-based graphical interfaces for both sides.  Requires `python3-gobject`
@@ -346,6 +386,16 @@ qvm-remote/
 ├── dom0/
 │   ├── qvm-remote-dom0              Dom0 daemon (Python)
 │   └── qvm-remote-dom0.service      Systemd unit
+├── webui/
+│   ├── qubes-global-admin-web       Web admin panel (2649 lines, stdlib only)
+│   ├── qubes-global-admin-web.service  Systemd unit
+│   ├── qubes-admin-autostart.sh     Autostart script
+│   └── devilspie2.lua               Window management rules
+├── gui2/
+│   ├── qubes-global-admin           GTK admin panel (978 lines)
+│   ├── qubes-global-admin-dom0      Dom0 admin daemon (542 lines)
+│   ├── qubes_admin_ui.py            Shared UI components
+│   └── *.desktop                    Desktop entries
 ├── gui/
 │   ├── qubes_remote_ui.py           Shared GTK3 UI library
 │   ├── qvm-remote-gui               VM GUI (GTK3)
