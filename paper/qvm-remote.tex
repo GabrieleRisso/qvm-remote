@@ -537,7 +537,7 @@ Dom0 recomputes $\tau'$ from its stored key and verifies:
 \end{equation}
 
 using Python's constant-time comparison~\cite{python2024hmac} to
-prevent timing side-channel attacks~\cite{brumley2011remote}.
+prevent timing side-channel attacks~\cite{brumley2005remote}.
 
 \subsection{Security Properties}
 
@@ -851,7 +851,7 @@ framework generalizes to arbitrary commands.
 \textbf{Authenticated RPC systems.}
 Kerberos~\cite{neuman2005kerberos} provides network authentication
 but requires a network stack and KDC infrastructure.
-SPIFFE/SPIRE~\cite{feldman2021spiffe} provides workload identity in
+SPIFFE/SPIRE~\cite{spiffe2024} provides workload identity in
 cloud-native environments. The present system's file-based,
 network-free authentication is specifically designed for the
 constrained dom0 environment.
@@ -988,10 +988,10 @@ Python Software Foundation,
 ``hmac --- Keyed-hashing for message authentication,''
 \textit{Python Standard Library Documentation}, 2024.
 
-\bibitem{brumley2011remote}
+\bibitem{brumley2005remote}
 D.~Brumley and D.~Boneh,
 ``Remote timing attacks are practical,''
-\textit{Computer Networks}, vol.~48, no.~5, 2005.
+\textit{Computer Networks}, vol.~48, no.~5, pp.~701--716, 2005.
 
 \bibitem{bernstein2012security}
 D.~J.~Bernstein,
@@ -1038,10 +1038,11 @@ C.~Neuman, T.~Yu, S.~Hartman, and K.~Raeburn,
 ``The Kerberos network authentication service (V5),''
 \textit{RFC 4120}, IETF, 2005.
 
-\bibitem{feldman2021spiffe}
-E.~Feldman et al.,
-``SPIFFE: Secure production identity framework for everyone,''
-\textit{CNCF}, 2021.
+\bibitem{spiffe2024}
+Cloud Native Computing Foundation,
+``SPIFFE: Secure Production Identity Framework for Everyone,''
+\textit{CNCF Specification}, 2024.
+\url{https://spiffe.io/}
 
 \bibitem{russinovich2012windows}
 M.~E.~Russinovich, D.~A.~Solomon, and A.~Ionescu,

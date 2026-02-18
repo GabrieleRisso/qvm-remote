@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2026/dev/Arch Linux) (preloaded format=pdflatex 2026.2.18)  18 FEB 2026 12:22
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2026/dev/Arch Linux) (preloaded format=pdflatex 2026.2.18)  18 FEB 2026 12:36
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1207,11 +1207,11 @@ Package rerunfilecheck Info: File `qvm-remote.out' has not changed.
 (rerunfilecheck)             Checksum: FF8387C6B1735A8E8FB38C57ECEE8976;5267.
  ) 
 Here is how much of TeX's memory you used:
- 30616 strings out of 475171
- 566842 string characters out of 5767095
- 1093843 words of memory out of 5000000
+ 30620 strings out of 475171
+ 566870 string characters out of 5767095
+ 1093836 words of memory out of 5000000
  52622 multiletter control sequences out of 15000+600000
- 714833 words of font info for 280 fonts, out of 8000000 for 9000
+ 715052 words of font info for 282 fonts, out of 8000000 for 9000
  14 hyphenation exceptions out of 8191
  84i,12n,94p,1007b,1342s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/share/texmf-dist/fonts/type1/public/lm/lmbx10.pfb></usr/share/texmf-dis
@@ -1235,10 +1235,10 @@ xmf-dist/fonts/type1/public/lm/lmtt10.pfb></usr/share/texmf-dist/fonts/type1/pu
 blic/lm/lmtt8.pfb></usr/share/texmf-dist/fonts/type1/public/lm/lmtt9.pfb></usr/
 share/texmf-dist/fonts/type1/public/lm/lmtti10.pfb></usr/share/texmf-dist/fonts
 /type1/urw/zapfding/uzdr.pfb>
-Output written on qvm-remote.pdf (7 pages, 618942 bytes).
+Output written on qvm-remote.pdf (7 pages, 620038 bytes).
 PDF statistics:
- 567 PDF objects out of 1000 (max. 8388607)
- 452 compressed objects within 5 object streams
+ 568 PDF objects out of 1000 (max. 8388607)
+ 453 compressed objects within 5 object streams
  112 named destinations out of 1000 (max. 500000)
  84993 words of extra memory for PDF output out of 89155 (max. 10000000)
 
