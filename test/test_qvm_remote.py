@@ -175,6 +175,20 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("gen | show | import", r.stderr)
 
+    def test_vm_client_timeout_rejects_non_integer(self):
+        r = run(["python3", str(VM_CLIENT), "-t", "abc", "qvm-ls"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("integer", r.stderr)
+
+    def test_vm_client_timeout_rejects_zero(self):
+        r = run(["python3", str(VM_CLIENT), "-t", "0", "qvm-ls"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("positive", r.stderr)
+
+    def test_vm_client_timeout_rejects_negative(self):
+        r = run(["python3", str(VM_CLIENT), "-t", "-5", "qvm-ls"])
+        self.assertNotEqual(r.returncode, 0)
+
 
 # ── HMAC ─────────────────────────────────────────────────────────────
 
@@ -434,6 +448,58 @@ class TestSecurity(unittest.TestCase):
         self.assertIn("VM_USER", src,
                        "Install script must support configurable VM user")
 
+    def test_daemon_has_require_root_guard(self):
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("require_root", src,
+                       "Daemon must have require_root privilege checks")
+
+    def test_daemon_authorize_requires_root(self):
+        r = run(["python3", str(DOM0_DAEMON), "authorize", "testvm", "a" * 64])
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("root", r.stderr)
+
+    def test_daemon_enable_requires_root(self):
+        r = subprocess.run(
+            ["python3", str(DOM0_DAEMON), "enable"],
+            input="no\n", capture_output=True, text=True,
+            cwd=str(REPO_ROOT),
+        )
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("root", r.stderr)
+
+    def test_daemon_disable_requires_root(self):
+        r = run(["python3", str(DOM0_DAEMON), "disable"])
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("root", r.stderr)
+
+    def test_daemon_mode_requires_root(self):
+        r = run(["python3", str(DOM0_DAEMON), "--vm", "testvm"])
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("root", r.stderr)
+
+    def test_daemon_catches_permission_error_gracefully(self):
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("except PermissionError", src,
+                       "Daemon must catch PermissionError at top level")
+
+    def test_client_catches_permission_error_gracefully(self):
+        src = VM_CLIENT.read_text()
+        self.assertIn("except PermissionError", src,
+                       "Client must catch PermissionError at top level")
+
+    def test_client_ping_failure_includes_troubleshooting(self):
+        src = VM_CLIENT.read_text()
+        self.assertIn("troubleshooting", src,
+                       "Ping failure must include troubleshooting hints")
+
 
 # ── packaging ────────────────────────────────────────────────────────
 
@@ -536,7 +602,7 @@ class TestBuild(unittest.TestCase):
     def test_dist_spec_contains_correct_version(self):
         ver = VERSION_FILE.read_text().strip()
         spec = REPO_ROOT / "build" / "SPECS" / "qvm-remote-dom0.spec"
-        if not spec.exists():
+        if not spec.exists() or f"Version:        {ver}" not in spec.read_text():
             run(["make", "dist"])
         self.assertIn(f"Version:        {ver}", spec.read_text())
 

@@ -5,7 +5,7 @@
 # Install with: makepkg -si
 
 pkgname=qvm-remote
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Execute commands in Qubes OS dom0 from a VM'
 arch=('any')
