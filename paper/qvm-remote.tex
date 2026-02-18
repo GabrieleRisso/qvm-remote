@@ -10,7 +10,7 @@
 \usepackage{xcolor}
 \usepackage{tikz}
 \usetikzlibrary{positioning,arrows.meta,fit,shapes.geometric,calc,
-                decorations.pathreplacing,backgrounds,shadows.blur,
+                decorations.pathreplacing,backgrounds,
                 patterns,decorations.markings,matrix}
 \usepackage{booktabs}
 \usepackage{enumitem}
@@ -273,114 +273,117 @@ function is a pseudorandom function~\cite{bellare2006new}.
 \begin{figure*}[t]
 \centering
 \begin{tikzpicture}[
-    >=Stealth,
-    node distance=0.4cm,
-    comp/.style={draw, rounded corners=4pt, minimum width=3cm,
-                 minimum height=0.6cm, font=\sffamily\small,
-                 thick, blur shadow={shadow blur steps=5,
-                 shadow xshift=0.5pt, shadow yshift=-0.5pt}},
-    qcomp/.style={draw, rounded corners=3pt, minimum width=2.4cm,
-                  minimum height=0.48cm, font=\sffamily\fontsize{7}{8}\selectfont},
-    domframe/.style={draw, rounded corners=8pt, thick, inner sep=11pt},
-    flow/.style={->, line width=1.5pt, >=Stealth},
-    pullflow/.style={->, line width=1.8pt, >=Stealth, color=blue1,
+    >=Stealth, scale=0.82, every node/.style={scale=0.82},
+    comp/.style={draw, rounded corners=3pt, minimum width=2.5cm,
+                 minimum height=0.5cm,
+                 font=\sffamily\fontsize{7}{8.5}\selectfont, thick},
+    qcomp/.style={draw, rounded corners=3pt, minimum width=2cm,
+                  minimum height=0.42cm,
+                  font=\sffamily\fontsize{6.5}{7.5}\selectfont},
+    domframe/.style={draw, rounded corners=6pt, thick, inner sep=8pt},
+    flow/.style={->, line width=1.3pt, >=Stealth},
+    pullflow/.style={->, line width=1.5pt, >=Stealth, color=blue1,
                      postaction={decorate, decoration={markings,
                      mark=at position 0.55 with {\node[above=-1pt,
-                     font=\sffamily\fontsize{6}{7}\selectfont,
-                     color=blue1] {qvm-run};}}}},
-    retflow/.style={->, line width=1.5pt, >=Stealth, color=green1,
+                     font=\sffamily\fontsize{5.5}{6.5}\selectfont,
+                     color=blue1] {qvm-run --pass-io};}}}},
+    retflow/.style={->, line width=1.3pt, >=Stealth, color=green1,
                     postaction={decorate, decoration={markings,
                     mark=at position 0.5 with {\node[below=-1pt,
-                    font=\sffamily\fontsize{6}{7}\selectfont,
-                    color=green1] {results};}}}},
-    num/.style={circle, inner sep=1.5pt, font=\sffamily\bfseries\scriptsize,
-                text=white},
+                    font=\sffamily\fontsize{5.5}{6.5}\selectfont,
+                    color=green1] {stdout / results};}}}},
+    num/.style={circle, inner sep=1.5pt,
+                font=\sffamily\bfseries\fontsize{6.5}{7.5}\selectfont,
+                text=white, minimum size=14pt},
 ]
 
 % ── VM ──
-\node[domframe, fill=orange1!6, draw=orange1!60,
-      minimum width=6.5cm, minimum height=5.8cm] (vmf) at (0,0) {};
-\node[font=\sffamily\bfseries\small, color=orange1!90,
+\node[domframe, fill=orange1!5, draw=orange1!55,
+      minimum width=5.5cm, minimum height=5cm] (vmf) at (0,0.4) {};
+\node[font=\sffamily\bfseries\fontsize{7.5}{9}\selectfont, color=orange1!85,
       anchor=north west]
-    at ([xshift=4pt,yshift=-4pt]vmf.north west)
+    at ([xshift=3pt,yshift=-3pt]vmf.north west)
     {Unprivileged VM};
 
-\node[comp, fill=orange1!18, draw=orange1!60, text=orange1!90]
-    (client) at ([yshift=-1.1cm]vmf.north) {VM Client};
+\node[comp, fill=orange1!14, draw=orange1!50, text=orange1!85]
+    (client) at ([yshift=-0.9cm]vmf.north) {VM Client};
 
-\node[domframe, fill=teal1!6, draw=teal1!50,
-      minimum width=5.5cm, minimum height=2.5cm,
-      below=0.5cm of client] (qf) {};
-\node[font=\sffamily\bfseries\fontsize{7}{8}\selectfont,
-      color=teal1!80, anchor=north west]
+\node[domframe, fill=teal1!5, draw=teal1!40,
+      minimum width=4.5cm, minimum height=2.2cm,
+      below=0.4cm of client] (qf) {};
+\node[font=\sffamily\bfseries\fontsize{6.5}{7.5}\selectfont,
+      color=teal1!75, anchor=north west]
     at ([xshift=3pt,yshift=-3pt]qf.north west)
     {\textasciitilde/.qvm-remote/queue/};
 
-\node[qcomp, fill=teal1!15, draw=teal1!45, text=teal1!85,
-      below=0.35cm of qf.north] (pend) {pending/};
-\node[qcomp, fill=yellow1!12, draw=yellow1!40, text=yellow1!85,
-      below=0.12cm of pend] (run) {running/};
-\node[qcomp, fill=green1!12, draw=green1!40, text=green1!80,
-      below=0.12cm of run] (res) {results/};
+\node[qcomp, fill=teal1!12, draw=teal1!40, text=teal1!80,
+      below=0.3cm of qf.north] (pend) {pending/};
+\node[qcomp, fill=yellow1!10, draw=yellow1!35, text=yellow1!80,
+      below=0.1cm of pend] (run) {running/};
+\node[qcomp, fill=green1!10, draw=green1!35, text=green1!75,
+      below=0.1cm of run] (res) {results/};
 
 % ── dom0 ──
-\node[domframe, fill=blue1!6, draw=blue1!60,
-      minimum width=6.5cm, minimum height=5.8cm,
-      right=4.5cm of vmf] (d0f) {};
-\node[font=\sffamily\bfseries\small, color=blue1!90,
+\node[domframe, fill=blue1!5, draw=blue1!55,
+      minimum width=5.5cm, minimum height=5cm,
+      right=3.5cm of vmf] (d0f) {};
+\node[font=\sffamily\bfseries\fontsize{7.5}{9}\selectfont, color=blue1!85,
       anchor=north west]
-    at ([xshift=4pt,yshift=-4pt]d0f.north west)
+    at ([xshift=3pt,yshift=-3pt]d0f.north west)
     {Control Domain (dom0)};
 
-\node[comp, fill=blue1!18, draw=blue1!60, text=blue1!90]
-    (daemon) at ([yshift=-1.1cm]d0f.north) {Dom0 Daemon};
+\node[comp, fill=blue1!14, draw=blue1!50, text=blue1!85]
+    (daemon) at ([yshift=-0.9cm]d0f.north) {Dom0 Daemon};
 
-\node[domframe, fill=blue1!4, draw=blue1!30,
-      minimum width=5.5cm, minimum height=2.5cm,
-      below=0.5cm of daemon] (d0int) {};
-\node[font=\sffamily\bfseries\fontsize{7}{8}\selectfont,
-      color=blue1!60, anchor=north west]
+\node[domframe, fill=blue1!3, draw=blue1!25,
+      minimum width=4.5cm, minimum height=2.2cm,
+      below=0.4cm of daemon] (d0int) {};
+\node[font=\sffamily\bfseries\fontsize{6.5}{7.5}\selectfont,
+      color=blue1!55, anchor=north west]
     at ([xshift=3pt,yshift=-3pt]d0int.north west)
     {dom0 storage};
 
-\node[qcomp, fill=purple1!12, draw=purple1!40, text=purple1!80,
-      below=0.35cm of d0int.north]
+\node[qcomp, fill=purple1!10, draw=purple1!35, text=purple1!75,
+      below=0.3cm of d0int.north]
     (keys) {/etc/qubes/remote.d/};
-\node[qcomp, fill=yellow1!10, draw=yellow1!35, text=yellow1!80,
-      below=0.12cm of keys]
+\node[qcomp, fill=yellow1!8, draw=yellow1!30, text=yellow1!75,
+      below=0.1cm of keys]
     (dlog) {/var/log/qubes/};
-\node[qcomp, fill=red1!10, draw=red1!35, text=red1!70,
-      below=0.12cm of dlog]
+\node[qcomp, fill=red1!8, draw=red1!30, text=red1!65,
+      below=0.1cm of dlog]
     (work) {/var/run/qvm-remote/};
 
-% ── Step numbering ──
-\node[num, fill=orange1!80] at ([xshift=-2.8cm,yshift=0.2cm]client.east) {1};
-\node[num, fill=blue1!80] at ([xshift=0.4cm,yshift=6pt]d0f.west) {2};
-\node[num, fill=purple1!80] at ([xshift=-0.4cm]keys.west) {3};
-\node[num, fill=red1!80] at ([xshift=-0.4cm]work.west) {4};
-\node[num, fill=green1!80] at ([xshift=0.4cm,yshift=-6pt]d0f.west) {5};
+% ── Step numbers (placed outside boxes for visibility) ──
+\node[num, fill=orange1!75]
+    at ([xshift=-2.5cm,yshift=0cm]client.south) {1};
+\node[num, fill=blue1!75]
+    at ([xshift=2.5cm,yshift=0cm]daemon.south) {2};
+\node[num, fill=purple1!75]
+    at ([xshift=2.5cm]keys.east) {3};
+\node[num, fill=red1!70]
+    at ([xshift=2.5cm]work.east) {4};
+\node[num, fill=green1!75]
+    at ([xshift=-2.5cm]res.west) {5};
 
 % ── Write arrow ──
-\draw[flow, orange1!70] (client.south) --
-    node[right, font=\sffamily\fontsize{6}{7}\selectfont,
-         color=orange1!70] {write}
+\draw[flow, orange1!65] (client.south) --
+    node[right, font=\sffamily\fontsize{5.5}{6.5}\selectfont,
+         color=orange1!65] {write}
     (pend.north -| client.south);
 
 % ── dom0 → VM (pull) ──
-\draw[pullflow] ([yshift=6pt]d0f.west) -- ([yshift=6pt]vmf.east);
-\draw[retflow] ([yshift=-6pt]vmf.east) -- ([yshift=-6pt]d0f.west);
+\draw[pullflow] ([yshift=5pt]d0f.west) -- ([yshift=5pt]vmf.east);
+\draw[retflow] ([yshift=-5pt]vmf.east) -- ([yshift=-5pt]d0f.west);
 
-% ── Xen ──
-\node[draw, thick, fill=red1!8, draw=red1!60, rounded corners=4pt,
-      minimum width=17.5cm, minimum height=0.6cm,
-      font=\sffamily\bfseries\small, text=red1!80,
-      blur shadow={shadow blur steps=5,
-      shadow xshift=0.3pt, shadow yshift=-0.3pt},
-      below=0.8cm of d0f.south -| vmf.east] (xen)
+% ── Xen bar ──
+\node[draw, thick, fill=red1!6, draw=red1!50, rounded corners=3pt,
+      minimum width=14cm, minimum height=0.5cm,
+      font=\sffamily\bfseries\fontsize{7.5}{9}\selectfont, text=red1!70,
+      below=1.6cm of d0f.south -| vmf.east] (xen)
     {Xen Hypervisor --- All I/O Initiated by dom0};
 
-\draw[->, thick, dashed, red1!50] (vmf.south) -- (xen.north -| vmf.south);
-\draw[->, thick, dashed, red1!50] (d0f.south) -- (xen.north -| d0f.south);
+\draw[->, thick, dashed, red1!45] (vmf.south) -- (xen.north -| vmf.south);
+\draw[->, thick, dashed, red1!45] (d0f.south) -- (xen.north -| d0f.south);
 
 \end{tikzpicture}
 \caption{\textbf{Protocol architecture.}
@@ -439,29 +442,28 @@ nonces:
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}[
-    seg/.style={draw, thick, minimum height=0.65cm,
-                font=\sffamily\small,
-                inner xsep=5pt,
-                blur shadow={shadow blur steps=3,
-                shadow xshift=0.3pt, shadow yshift=-0.3pt}},
+    scale=0.88, every node/.style={scale=0.88},
+    seg/.style={draw, thick, minimum height=0.55cm,
+                font=\sffamily\fontsize{7}{8.5}\selectfont,
+                inner xsep=4pt},
 ]
-\node[seg, fill=blue1!15, draw=blue1!50, text=blue1!85,
-      minimum width=3cm, rounded corners=3pt]
+\node[seg, fill=blue1!12, draw=blue1!45, text=blue1!80,
+      minimum width=2.6cm, rounded corners=3pt]
     (ts) at (0,0) {20260218-143022};
-\node[seg, fill=orange1!15, draw=orange1!50, text=orange1!85,
-      minimum width=1.3cm, right=-\pgflinewidth of ts]
+\node[seg, fill=orange1!12, draw=orange1!45, text=orange1!80,
+      minimum width=1.1cm, right=-\pgflinewidth of ts]
     (pid) {1234};
-\node[seg, fill=purple1!15, draw=purple1!50, text=purple1!85,
-      minimum width=2cm, rounded corners=3pt,
+\node[seg, fill=purple1!12, draw=purple1!45, text=purple1!80,
+      minimum width=1.7cm, rounded corners=3pt,
       right=-\pgflinewidth of pid]
     (rand) {a1b2c3d4};
 
-\node[font=\sffamily\fontsize{6}{7}\selectfont, color=blue1!70,
-      below=0.12cm of ts] {wall-clock timestamp};
-\node[font=\sffamily\fontsize{6}{7}\selectfont, color=orange1!70,
-      below=0.12cm of pid] {PID};
-\node[font=\sffamily\fontsize{6}{7}\selectfont, color=purple1!70,
-      below=0.12cm of rand] {secrets.token\_hex(4)};
+\node[font=\sffamily\fontsize{5.5}{6.5}\selectfont, color=blue1!65,
+      below=0.1cm of ts] {wall-clock timestamp};
+\node[font=\sffamily\fontsize{5.5}{6.5}\selectfont, color=orange1!65,
+      below=0.1cm of pid] {PID};
+\node[font=\sffamily\fontsize{5.5}{6.5}\selectfont, color=purple1!65,
+      below=0.1cm of rand] {secrets.token\_hex(4)};
 \end{tikzpicture}
 \caption{Command identifier structure. The cryptographic random
 suffix ensures uniqueness even under concurrent execution.}
@@ -701,27 +703,33 @@ the defense-in-depth principle~\cite{nist800-53,bishop2003computer}.
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}[
-    layer/.style={draw, rounded corners=5pt, thick,
-                  minimum height=0.75cm, font=\sffamily\small,
-                  text=white, align=center,
-                  blur shadow={shadow blur steps=5,
-                  shadow xshift=0.3pt, shadow yshift=-0.3pt}},
+    scale=0.88, every node/.style={scale=0.88},
+    layer/.style={draw, rounded corners=4pt, thick,
+                  minimum height=0.65cm,
+                  font=\sffamily\fontsize{7}{8.5}\selectfont,
+                  align=center},
 ]
-\node[layer, fill=red1!85, minimum width=7.4cm] (l1) at (0,0)
+\node[layer, fill=red1!12, draw=red1!50, text=red1!80,
+      minimum width=6.8cm] (l1) at (0.4,0)
     {\textbf{L1:} HMAC-SHA256 Authentication};
-\node[layer, fill=orange1!85, minimum width=6cm] (l2) at (0,1)
+\node[layer, fill=orange1!12, draw=orange1!50, text=orange1!80,
+      minimum width=5.4cm] (l2) at (0.4,0.85)
     {\textbf{L2:} Input Validation};
-\node[layer, fill=blue1!85, minimum width=4.6cm] (l3) at (0,2)
+\node[layer, fill=blue1!12, draw=blue1!50, text=blue1!80,
+      minimum width=4.1cm] (l3) at (0.4,1.7)
     {\textbf{L3:} Execution Sandboxing};
-\node[layer, fill=purple1!85, minimum width=3.3cm] (l4) at (0,3)
+\node[layer, fill=purple1!12, draw=purple1!50, text=purple1!80,
+      minimum width=2.9cm] (l4) at (0.4,2.55)
     {\textbf{L4:} Audit Trail};
-\node[layer, fill=green1!85, minimum width=2.1cm] (l5) at (0,4)
+\node[layer, fill=green1!12, draw=green1!50, text=green1!80,
+      minimum width=1.9cm] (l5) at (0.4,3.4)
     {\textbf{L5:} Transient};
 
-\draw[decorate, decoration={brace, amplitude=6pt, mirror},
-      thick, gray1] (3.9,0) -- (3.9,4)
-    node[midway, right=8pt, font=\sffamily\scriptsize,
-         text=gray1, align=left]
+\draw[decorate, decoration={brace, amplitude=5pt},
+      thick, gray1] (-3.1,-0.05) -- (-3.1,3.45)
+    node[midway, left=7pt,
+         font=\sffamily\fontsize{6.5}{8}\selectfont,
+         text=gray1, align=right]
     {Independent\\containment\\layers};
 \end{tikzpicture}
 \caption{\textbf{Five-layer defense-in-depth model.} Each layer
