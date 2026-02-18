@@ -188,6 +188,29 @@ Per-VM keys in `/etc/qubes/remote.d/`:
 
 The VM client requires no configuration beyond the key file.
 
+## GUI (optional)
+
+GTK3-based graphical interfaces for both sides.  Requires `python3-gobject`
+and `gtk3`.
+
+```bash
+# VM: install CLI + GUI
+sudo make install-vm
+sudo make install-gui-vm
+
+# Dom0: install daemon + GUI
+sudo make install-dom0
+sudo make install-gui-dom0
+```
+
+**VM GUI** (`qvm-remote-gui`): Execute commands, file transfers, backup/restore,
+command history, key management, audit log viewer.
+
+**Dom0 GUI** (`qvm-remote-dom0-gui`): Dashboard, VM authorization, file push,
+backup management, log viewer.
+
+Both follow Qubes OS desktop conventions with `.desktop` entries.
+
 ## Building
 
 ### Docker/Podman build (recommended for non-Fedora hosts)
@@ -201,6 +224,19 @@ make docker-rpm   # builds in Fedora 41 container
 ```bash
 make dist    # create source tarballs
 make rpm     # build RPMs (requires rpmbuild)
+```
+
+### Arch Linux
+
+```bash
+cd pkg && makepkg -si          # CLI only
+cd pkg && makepkg -si -p PKGBUILD-gui   # GUI
+```
+
+### Debian/Ubuntu
+
+```bash
+make deb
 ```
 
 ### Qubes Builder v2
@@ -220,8 +256,23 @@ Build: `./qb -c qvm-remote package fetch prep build`
 ### Testing
 
 ```bash
-make test    # run full test suite
-make check   # syntax-check scripts only
+make check              # syntax-check all scripts
+make test               # unit tests (CLI + GUI, any machine)
+make docker-test        # RPM install test (Fedora 41 container)
+make dom0-test          # dom0 simulation E2E (73 assertions)
+make arch-test          # Arch Linux client test (36 assertions)
+make gui-test           # GUI build + import test
+make gui-integration-test  # GUI Xvfb integration test
+make backup-e2e-test    # backup/restore E2E test
+make all-test           # run ALL of the above
+```
+
+### Upgrading dom0
+
+```bash
+bash upgrade-dom0.sh              # upgrade daemon only
+bash upgrade-dom0.sh --gui        # upgrade daemon + GUI
+bash upgrade-dom0.sh --help       # see all options
 ```
 
 ## Security
@@ -290,29 +341,46 @@ Data directories migrate automatically on first run.  RPM packages use
 
 ```
 qvm-remote/
-├── dom0/
-│   ├── qvm-remote-dom0           Dom0 daemon (Python)
-│   └── qvm-remote-dom0.service   Systemd unit
 ├── vm/
-│   └── qvm-remote                VM client (Python)
-├── etc/
-│   └── qubes-remote.conf         Config template
-├── rpm_spec/
-│   ├── qvm-remote-dom0.spec      Dom0 RPM spec
-│   └── qvm-remote-vm.spec        VM RPM spec
+│   └── qvm-remote                   VM client (Python)
+├── dom0/
+│   ├── qvm-remote-dom0              Dom0 daemon (Python)
+│   └── qvm-remote-dom0.service      Systemd unit
+├── gui/
+│   ├── qubes_remote_ui.py           Shared GTK3 UI library
+│   ├── qvm-remote-gui               VM GUI (GTK3)
+│   ├── qvm-remote-dom0-gui          Dom0 GUI (GTK3)
+│   └── *.desktop                    Desktop entries
 ├── install/
-│   └── install-dom0.sh           Dom0 shell installer
-├── salt/
-│   ├── qvm-remote/init.sls       Salt state
-│   ├── qvm-remote.top            Salt top file
-│   └── pillar/qvm-remote.sls     Salt pillar
+│   └── install-dom0.sh              Dom0 shell installer
+├── etc/
+│   └── qubes-remote.conf            Config template
+├── rpm_spec/
+│   ├── qvm-remote-dom0.spec         Dom0 CLI RPM
+│   ├── qvm-remote-vm.spec           VM CLI RPM
+│   ├── qvm-remote-gui-dom0.spec     Dom0 GUI RPM
+│   └── qvm-remote-gui-vm.spec       VM GUI RPM
+├── pkg/
+│   ├── PKGBUILD                     Arch Linux CLI package
+│   └── PKGBUILD-gui                 Arch Linux GUI package
+├── debian/                           Debian packaging
+├── salt/                             SaltStack formula
 ├── test/
-│   └── test_qvm_remote.py        Python test suite
-├── .qubesbuilder                  Qubes Builder v2 config
-├── Dockerfile.build               Fedora 41 build container
+│   ├── test_qvm_remote.py           CLI unit tests (92 tests)
+│   ├── test_gui.py                  GUI unit tests
+│   ├── test_gui_wiring.py           GUI wiring tests
+│   ├── test_gui_integration.py      GUI integration tests
+│   ├── test_backup_e2e.py           Backup E2E tests
+│   ├── dom0-sim/                    Mock dom0 environment
+│   └── Dockerfile.*                 Container test harnesses
+├── .github/workflows/ci.yml         GitHub Actions CI
+├── .qubesbuilder                     Qubes Builder v2 config
+├── Makefile.builder                  Qubes Builder v2 Makefile
+├── Dockerfile.build                  Fedora 41 build container
+├── upgrade-dom0.sh                   Dom0 upgrade script
 ├── Makefile
 ├── version
-└── README.md
+└── CONTRIBUTING.md
 ```
 
 ## Contributing

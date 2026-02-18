@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	$(MAKE) install-vm DESTDIR=$(CURDIR)/debian/qvm-remote
+	$(MAKE) install-gui-vm DESTDIR=$(CURDIR)/debian/qvm-remote-gui
+
+override_dh_auto_build:
+	# Pure Python -- nothing to compile.
+
+override_dh_auto_test:
+	$(MAKE) check

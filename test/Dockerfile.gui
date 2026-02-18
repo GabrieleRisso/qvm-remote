@@ -1,0 +1,100 @@
+# Dockerfile.gui -- GUI build, install, and import verification
+#
+# Tests that the GUI packages compile, install correctly, and that the
+# shared module can be imported in a headless environment.
+#
+# Usage: podman build -f test/Dockerfile.gui -t qvm-remote-gui-test .
+
+# ── Stage 1: Build and syntax check ────────────────────────────────
+FROM registry.fedoraproject.org/fedora:41 AS builder
+
+RUN dnf install -y python3 make rpm-build rpmdevtools systemd-rpm-macros \
+    python3-gobject gtk3 createrepo_c && dnf clean all
+
+COPY . /build
+WORKDIR /build
+
+# Syntax check all files including GUI
+RUN make check
+
+# Build all tarballs and RPMs
+RUN make dist && make rpm
+
+# ── Stage 2: Verify RPM installation ───────────────────────────────
+FROM registry.fedoraproject.org/fedora:41 AS verify
+
+RUN dnf install -y python3 python3-gobject gtk3 && dnf clean all
+
+COPY --from=builder /build/build/RPMS/noarch/*.rpm /tmp/rpms/
+
+# Install CLI packages first (dependencies)
+RUN rpm -ivh /tmp/rpms/qvm-remote-1*.rpm --nodeps 2>/dev/null || true
+RUN rpm -ivh /tmp/rpms/qvm-remote-dom0-1*.rpm --nodeps 2>/dev/null || true
+
+# Install GUI packages
+RUN rpm -ivh /tmp/rpms/qvm-remote-gui-1*.rpm --nodeps 2>/dev/null || true
+RUN rpm -ivh /tmp/rpms/qvm-remote-gui-dom0-1*.rpm --nodeps 2>/dev/null || true
+
+# Verify file placement
+RUN test -x /usr/bin/qvm-remote-gui \
+    && echo "PASS: qvm-remote-gui installed"
+RUN test -x /usr/bin/qvm-remote-dom0-gui \
+    && echo "PASS: qvm-remote-dom0-gui installed"
+RUN test -f /usr/lib/qvm-remote/qubes_remote_ui.py \
+    && echo "PASS: shared module installed"
+RUN test -f /usr/share/applications/qvm-remote-gui.desktop \
+    && echo "PASS: VM desktop entry installed"
+RUN test -f /usr/share/applications/qvm-remote-dom0-gui.desktop \
+    && echo "PASS: dom0 desktop entry installed"
+
+# Verify shared module can be imported and has expected attributes
+RUN python3 -c "import sys; sys.path.insert(0, '/usr/lib/qvm-remote'); import qubes_remote_ui; \
+    [getattr(qubes_remote_ui, a) for a in \
+    ['UI_VERSION','QUBES_COLORS','LABEL_COLORS','apply_css','OutputView','StatusIndicator','CommandRunner','run_quick']]; \
+    print('PASS: shared module imports correctly')"
+
+# Verify backup functions importable from installed RPM location
+RUN python3 -c "import sys; sys.path.insert(0, '/usr/lib/qvm-remote'); \
+    from qubes_remote_ui import create_local_backup, restore_local_backup, \
+    list_local_backups, get_change_summary, git_backup_push, git_backup_pull, \
+    NOTIFY_ICON_BACKUP; \
+    print('PASS: all backup functions importable from install location')"
+
+# Verify syntax of installed scripts
+RUN python3 -c "import py_compile; py_compile.compile('/usr/bin/qvm-remote-gui', doraise=True)" \
+    && echo "PASS: qvm-remote-gui syntax OK"
+RUN python3 -c "import py_compile; py_compile.compile('/usr/bin/qvm-remote-dom0-gui', doraise=True)" \
+    && echo "PASS: qvm-remote-dom0-gui syntax OK"
+
+# Verify shebangs
+RUN head -1 /usr/bin/qvm-remote-gui | grep -q python3 \
+    && echo "PASS: qvm-remote-gui shebang OK"
+RUN head -1 /usr/bin/qvm-remote-dom0-gui | grep -q python3 \
+    && echo "PASS: qvm-remote-dom0-gui shebang OK"
+
+# Verify desktop entry validity (basic)
+RUN grep -q "Type=Application" /usr/share/applications/qvm-remote-gui.desktop \
+    && echo "PASS: VM desktop entry valid"
+RUN grep -q "Type=Application" /usr/share/applications/qvm-remote-dom0-gui.desktop \
+    && echo "PASS: dom0 desktop entry valid"
+
+# Verify RPM metadata
+RUN rpm -qi qvm-remote-gui 2>/dev/null | grep -q "GTK3" \
+    && echo "PASS: qvm-remote-gui RPM description OK"
+RUN rpm -qi qvm-remote-gui-dom0 2>/dev/null | grep -q "GTK3" \
+    && echo "PASS: qvm-remote-gui-dom0 RPM description OK"
+
+# ── Stage 3: Run Python test suite ─────────────────────────────────
+FROM registry.fedoraproject.org/fedora:41 AS test
+
+RUN dnf install -y python3 python3-gobject gtk3 make && dnf clean all
+
+COPY . /build
+WORKDIR /build
+
+# Run the GUI test suites (headless, no display required)
+RUN python3 test/test_gui.py -v
+RUN python3 test/test_gui_wiring.py -v
+
+RUN echo ""
+RUN echo "=== All GUI tests passed ==="

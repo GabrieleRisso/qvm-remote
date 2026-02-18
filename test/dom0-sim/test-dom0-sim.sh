@@ -123,9 +123,10 @@ echo "── Phase 2: CLI Verification ─────────────�
 echo ""
 
 assert_contains "qvm-remote --help" "$(qvm-remote --help 2>&1)" "Execute commands"
-assert_contains "qvm-remote --version" "$(qvm-remote --version 2>&1)" "qvm-remote 1.0.0"
+EXPECTED_VER=$(cat /build/version 2>/dev/null || echo "1.1.0")
+assert_contains "qvm-remote --version" "$(qvm-remote --version 2>&1)" "qvm-remote $EXPECTED_VER"
 assert_contains "qvm-remote-dom0 --help" "$(qvm-remote-dom0 --help 2>&1)" "Dom0 executor"
-assert_contains "qvm-remote-dom0 --version" "$(qvm-remote-dom0 --version 2>&1)" "qvm-remote-dom0 1.0.0"
+assert_contains "qvm-remote-dom0 --version" "$(qvm-remote-dom0 --version 2>&1)" "qvm-remote-dom0 $EXPECTED_VER"
 
 # Error handling
 R=$(qvm-remote --bogus 2>&1); assert_eq "qvm-remote --bogus fails" "1" "$?"

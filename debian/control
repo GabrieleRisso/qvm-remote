@@ -1,0 +1,23 @@
+Source: qvm-remote
+Section: admin
+Priority: optional
+Maintainer: qvm-remote contributors <qvm-remote@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), make
+Standards-Version: 4.6.2
+
+Package: qvm-remote
+Architecture: all
+Depends: python3 (>= 3.8), ${misc:Depends}
+Description: Execute commands in Qubes OS dom0 from a VM
+ Client tool for qvm-remote. Submits commands to a file-based queue,
+ waits for the dom0-side daemon to process them, and returns the result
+ with full stdout/stderr passthrough and exit code preservation.
+
+Package: qvm-remote-gui
+Architecture: all
+Depends: qvm-remote (>= 1.0.0), python3 (>= 3.8), python3-gi (>= 3.30),
+         gir1.2-gtk-3.0, ${misc:Depends}
+Description: GTK3 graphical interface for qvm-remote (VM client)
+ Provides a tabbed GTK3 interface for command execution with streaming
+ output, command history, authentication key management, and audit log
+ viewing. Built following Qubes OS 4.3 UI conventions.

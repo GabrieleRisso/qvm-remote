@@ -1,0 +1,25 @@
+# Maintainer: qvm-remote contributors
+# PKGBUILD for qvm-remote-gui -- Qubes OS VM client GTK3 interface
+#
+# Only the VM-side GUI is packaged (dom0 is always Fedora in Qubes OS).
+# Install with: makepkg -p PKGBUILD-gui -si
+
+pkgname=qvm-remote-gui
+pkgver=1.1.0
+pkgrel=1
+pkgdesc='GTK3 graphical interface for qvm-remote (Qubes OS VM client)'
+arch=('any')
+url='https://github.com/user/qvm-remote'
+license=('GPL-2.0-or-later')
+depends=('qvm-remote' 'python>=3.8' 'python-gobject' 'gtk3')
+makedepends=('make')
+source=()
+
+pkgver() {
+    cat "${srcdir}/../../version" 2>/dev/null || echo "$pkgver"
+}
+
+package() {
+    cd "${srcdir}/../.."
+    make install-gui-vm DESTDIR="${pkgdir}"
+}

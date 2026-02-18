@@ -1,0 +1,35 @@
+# Dockerfile.gui-integration -- GUI integration tests with Xvfb
+#
+# Actually starts the GUI applications under a headless X11 server (Xvfb)
+# and verifies they initialize, render, and exit cleanly.
+# Also tests display guard, CLI-GUI data interop, and hex validation.
+#
+# Usage: podman build -f test/Dockerfile.gui-integration -t qvm-remote-gui-integration .
+
+FROM registry.fedoraproject.org/fedora:41
+
+RUN dnf install -y python3 python3-gobject gtk3 make xorg-x11-server-Xvfb \
+    && dnf clean all
+
+COPY . /build
+WORKDIR /build
+
+# Install CLI and GUI
+RUN make install-vm DESTDIR=/ && make install-gui-vm DESTDIR=/
+
+# Syntax check
+RUN make check
+
+# Run headless unit tests (no display needed)
+RUN python3 test/test_gui.py -v
+
+# Run wiring tests (headless portion)
+RUN python3 test/test_gui_wiring.py -v
+
+# Run integration tests under Xvfb (actual GUI launch)
+RUN xvfb-run -a python3 test/test_gui_integration.py -v
+
+# Run live wiring tests under Xvfb (instantiates GTK windows)
+RUN xvfb-run -a python3 test/test_gui_wiring.py -v
+
+RUN echo "=== GUI integration tests passed ==="

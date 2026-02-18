@@ -65,8 +65,9 @@ RUN test -x /usr/bin/qvm-remote-dom0
 RUN qvm-remote --version
 RUN qvm-remote-dom0 --version
 
-# Copy install script and test script
+# Copy install script, test script, and version file
 COPY --from=builder /build/install/install-dom0.sh /tmp/install-dom0.sh
+COPY --from=builder /build/version /build/version
 COPY test/dom0-sim/test-dom0-sim.sh /tmp/test-dom0-sim.sh
 RUN chmod +x /tmp/test-dom0-sim.sh
 

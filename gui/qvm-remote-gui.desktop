@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Qubes Remote Command
+Comment=Execute commands in dom0 from this VM
+Exec=/usr/bin/qvm-remote-gui
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=System;Utility;
+Keywords=qubes;remote;dom0;command;
+StartupNotify=true

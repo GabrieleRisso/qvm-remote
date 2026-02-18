@@ -1,0 +1,1814 @@
+#!/usr/bin/python3
+# qvm-remote-gui -- GTK3 graphical interface for qvm-remote (VM client)
+#
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Graphical interface for executing commands in Qubes OS dom0.
+
+Provides a tabbed interface for command execution with streaming output,
+command history, authentication key management, and audit log viewing.
+Built with GTK3 following Qubes OS 4.3 UI conventions.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# Locate shared UI module: same directory (dev) or /usr/lib/qvm-remote (installed)
+_self_dir = os.path.dirname(os.path.abspath(__file__))
+for _p in [_self_dir, "/usr/lib/qvm-remote"]:
+    _mod = os.path.join(_p, "qubes_remote_ui.py")
+    if os.path.isfile(_mod) and _p not in sys.path:
+        sys.path.insert(0, _p)
+        break
+
+from qubes_remote_ui import check_display, require_gtk  # noqa: E402
+
+_disp_err = check_display()
+if _disp_err:
+    print(f"qvm-remote-gui: {_disp_err}", file=sys.stderr)
+    sys.exit(1)
+require_gtk()
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Pango  # noqa: E402
+
+from qubes_remote_ui import (  # noqa: E402
+    UI_VERSION,
+    QUBES_COLORS,
+    apply_css,
+    create_header_bar,
+    create_frame,
+    create_info_row,
+    show_error_dialog,
+    show_info_dialog,
+    show_confirm_dialog,
+    valid_hex_key,
+    OutputView,
+    StatusIndicator,
+    CommandRunner,
+    find_executable,
+    run_quick,
+    send_notification,
+    format_file_size,
+    create_local_backup,
+    restore_local_backup,
+    list_local_backups,
+    get_change_summary,
+    git_backup_push,
+    git_backup_pull,
+    NOTIFY_ICON_INFO,
+    NOTIFY_ICON_SUCCESS,
+    NOTIFY_ICON_WARNING,
+    NOTIFY_ICON_ERROR,
+    NOTIFY_ICON_SECURITY,
+    NOTIFY_ICON_NETWORK,
+    NOTIFY_ICON_TRANSFER,
+    NOTIFY_ICON_BACKUP,
+)
+
+APP_ID = "org.qubes-os.qvm-remote-gui"
+DATA_DIR = Path.home() / ".qvm-remote"
+LOG_FILE = DATA_DIR / "audit.log"
+KEY_FILE = DATA_DIR / "auth.key"
+HISTORY_DIR = DATA_DIR / "history"
+
+
+# ── Main window ─────────────────────────────────────────────────────
+
+
+class QvmRemoteWindow(Gtk.ApplicationWindow):
+    """Main application window with tabbed interface."""
+
+    def __init__(self, app):
+        super().__init__(application=app, title="Qubes Remote Command")
+        self.set_default_size(900, 660)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        self._qvm_remote = find_executable(
+            "qvm-remote",
+            [os.path.join(_self_dir, "..", "vm")],
+        )
+        self._runner = CommandRunner()
+        self._exec_start_time = None
+
+        header = create_header_bar("Qubes Remote Command", "Execute commands in dom0")
+        self.set_titlebar(header)
+
+        # Main layout
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # Notebook (tabs)
+        self._notebook = Gtk.Notebook()
+        self._notebook.set_tab_pos(Gtk.PositionType.TOP)
+        vbox.pack_start(self._notebook, True, True, 0)
+
+        self._build_execute_tab()
+        self._build_files_tab()
+        self._build_backup_tab()
+        self._build_history_tab()
+        self._build_keys_tab()
+        self._build_log_tab()
+
+        # Status bar
+        self._statusbar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=12
+        )
+        self._statusbar.set_margin_start(8)
+        self._statusbar.set_margin_end(8)
+        self._statusbar.set_margin_top(4)
+        self._statusbar.set_margin_bottom(4)
+
+        self._conn_status = StatusIndicator("Checking...", "inactive")
+        self._statusbar.pack_start(self._conn_status, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self._statusbar.pack_start(sep, False, False, 0)
+
+        self._last_result = Gtk.Label(label="No commands run yet")
+        self._last_result.set_halign(Gtk.Align.START)
+        self._statusbar.pack_start(self._last_result, True, True, 0)
+
+        vbox.pack_start(self._statusbar, False, False, 0)
+
+        # Keyboard shortcuts
+        accel = Gtk.AccelGroup()
+        # Ctrl+Return to execute
+        key, mod = Gtk.accelerator_parse("<Control>Return")
+        accel.connect(key, mod, 0, lambda *a: self._on_execute(None))
+        # Ctrl+L to clear output
+        key, mod = Gtk.accelerator_parse("<Control>l")
+        accel.connect(key, mod, 0, lambda *a: self._on_clear(None))
+        self.add_accel_group(accel)
+
+        # Check connection on startup
+        GLib.timeout_add(500, self._check_connection_async)
+
+    # ── Execute tab ─────────────────────────────────────────────────
+
+    def _build_execute_tab(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        paned.set_wide_handle(True)
+
+        # Top: command input
+        cmd_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        cmd_box.set_margin_start(10)
+        cmd_box.set_margin_end(10)
+        cmd_box.set_margin_top(10)
+
+        cmd_label = Gtk.Label()
+        cmd_label.set_markup("<b>Command</b>")
+        cmd_label.set_halign(Gtk.Align.START)
+        cmd_box.pack_start(cmd_label, False, False, 0)
+
+        # Command text entry (multi-line)
+        scroll_cmd = Gtk.ScrolledWindow()
+        scroll_cmd.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll_cmd.set_min_content_height(80)
+        scroll_cmd.set_max_content_height(200)
+        scroll_cmd.set_vexpand(False)
+
+        self._cmd_view = Gtk.TextView()
+        self._cmd_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._cmd_view.get_style_context().add_class("qvm-command")
+        self._cmd_view.set_left_margin(4)
+        self._cmd_view.set_right_margin(4)
+        self._cmd_view.set_top_margin(4)
+        self._cmd_view.set_bottom_margin(4)
+        scroll_cmd.add(self._cmd_view)
+        cmd_box.pack_start(scroll_cmd, False, False, 0)
+
+        # Controls row
+        ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ctrl_box.set_margin_bottom(6)
+
+        timeout_label = Gtk.Label(label="Timeout:")
+        ctrl_box.pack_start(timeout_label, False, False, 0)
+
+        adj = Gtk.Adjustment(value=300, lower=1, upper=7200, step_increment=10)
+        self._timeout_spin = Gtk.SpinButton(adjustment=adj, climb_rate=1, digits=0)
+        self._timeout_spin.set_tooltip_text("Maximum time in seconds for the command")
+        ctrl_box.pack_start(self._timeout_spin, False, False, 0)
+
+        sec_label = Gtk.Label(label="seconds")
+        ctrl_box.pack_start(sec_label, False, False, 0)
+
+        # Spacer
+        ctrl_box.pack_start(Gtk.Box(), True, True, 0)
+
+        self._clear_btn = Gtk.Button(label="Clear Output")
+        self._clear_btn.connect("clicked", self._on_clear)
+        ctrl_box.pack_start(self._clear_btn, False, False, 0)
+
+        self._cancel_btn = Gtk.Button(label="Cancel")
+        self._cancel_btn.set_sensitive(False)
+        self._cancel_btn.connect("clicked", self._on_cancel)
+        ctx = self._cancel_btn.get_style_context()
+        ctx.add_class("destructive-action")
+        ctrl_box.pack_start(self._cancel_btn, False, False, 0)
+
+        self._exec_btn = Gtk.Button(label="Execute")
+        self._exec_btn.connect("clicked", self._on_execute)
+        ctx = self._exec_btn.get_style_context()
+        ctx.add_class("suggested-action")
+        self._exec_btn.set_tooltip_text("Run command in dom0 (Ctrl+Return)")
+        ctrl_box.pack_start(self._exec_btn, False, False, 0)
+
+        cmd_box.pack_start(ctrl_box, False, False, 0)
+        paned.pack1(cmd_box, resize=False, shrink=False)
+
+        # Bottom: output
+        out_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        out_box.set_margin_start(10)
+        out_box.set_margin_end(10)
+        out_box.set_margin_bottom(10)
+
+        out_label = Gtk.Label()
+        out_label.set_markup("<b>Output</b>")
+        out_label.set_halign(Gtk.Align.START)
+        out_box.pack_start(out_label, False, False, 0)
+
+        self._output = OutputView()
+        out_box.pack_start(self._output, True, True, 0)
+        paned.pack2(out_box, resize=True, shrink=False)
+
+        paned.set_position(180)
+
+        self._notebook.append_page(paned, Gtk.Label(label="Execute"))
+
+    def _on_execute(self, _btn):
+        if self._runner.is_running:
+            return
+        buf = self._cmd_view.get_buffer()
+        cmd_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+        if not cmd_text:
+            show_error_dialog(self, "Empty Command", "Please enter a command to execute.")
+            return
+        if not self._qvm_remote:
+            show_error_dialog(
+                self,
+                "Tool Not Found",
+                "Could not find qvm-remote.\n"
+                "Install it with: make install-vm",
+            )
+            return
+
+        timeout = int(self._timeout_spin.get_value())
+        self._output.clear()
+        self._output.append(f"$ {cmd_text}\n", "info")
+
+        self._exec_btn.set_sensitive(False)
+        self._cancel_btn.set_sensitive(True)
+        self._cmd_view.set_sensitive(False)
+        self._exec_start_time = time.monotonic()
+
+        self._runner.run(
+            [self._qvm_remote, "-t", str(timeout)],
+            stdin_data=cmd_text + "\n",
+            on_stdout=lambda t: self._output.append(t, "stdout"),
+            on_stderr=lambda t: self._output.append(t, "stderr"),
+            on_done=self._on_exec_done,
+        )
+
+    def _on_exec_done(self, rc):
+        elapsed = time.monotonic() - self._exec_start_time if self._exec_start_time else 0
+        self._exec_btn.set_sensitive(True)
+        self._cancel_btn.set_sensitive(False)
+        self._cmd_view.set_sensitive(True)
+        self._cmd_view.grab_focus()
+
+        tag = "success" if rc == 0 else "stderr"
+        self._output.append(f"\n--- exit {rc} ({elapsed:.1f}s) ---\n", tag)
+
+        self._last_result.set_text(f"Exit: {rc}  |  Duration: {elapsed:.1f}s")
+
+        # Desktop notification (useful when window is not focused)
+        if rc == 0:
+            send_notification(
+                "Command completed",
+                f"Exit code 0 ({elapsed:.1f}s)",
+                icon=NOTIFY_ICON_SUCCESS,
+            )
+        else:
+            send_notification(
+                "Command failed",
+                f"Exit code {rc} ({elapsed:.1f}s)",
+                icon=NOTIFY_ICON_ERROR,
+                urgency="critical",
+            )
+
+        self._exec_start_time = None
+        return False
+
+    def _on_cancel(self, _btn):
+        if self._runner.is_running:
+            self._runner.cancel()
+            self._output.append("\n--- cancelled ---\n", "stderr")
+
+    def _on_clear(self, _btn):
+        self._output.clear()
+        return False  # for accel handler
+
+    # ── Files tab ──────────────────────────────────────────────────
+    # File transfer between this VM and dom0, integrated with qvm-remote.
+    # Uses base64 encoding through the command channel (respects HMAC auth).
+    # For inter-VM copies, generates the correct qvm-copy-to-vm / qvm-run
+    # commands and handles the Qubes file copy dialog automatically.
+
+    def _build_files_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_margin_start(12)
+        vbox.set_margin_end(12)
+        vbox.set_margin_top(12)
+        vbox.set_margin_bottom(12)
+
+        # ── Send file to dom0 ─────────────────────────────────
+        frame_send = create_frame("Send File to dom0")
+        send_grid = Gtk.Grid()
+        send_grid.set_column_spacing(8)
+        send_grid.set_row_spacing(8)
+        send_grid.set_margin_start(12)
+        send_grid.set_margin_end(12)
+        send_grid.set_margin_top(8)
+        send_grid.set_margin_bottom(8)
+
+        lbl_local = Gtk.Label(label="Local file:")
+        lbl_local.set_halign(Gtk.Align.END)
+        send_grid.attach(lbl_local, 0, 0, 1, 1)
+
+        self._send_local_entry = Gtk.Entry()
+        self._send_local_entry.set_placeholder_text("/home/user/document.txt")
+        self._send_local_entry.set_hexpand(True)
+        send_grid.attach(self._send_local_entry, 1, 0, 1, 1)
+
+        browse_btn = Gtk.Button(label="Browse...")
+        browse_btn.connect("clicked", self._on_send_browse)
+        send_grid.attach(browse_btn, 2, 0, 1, 1)
+
+        lbl_dest = Gtk.Label(label="Dom0 path:")
+        lbl_dest.set_halign(Gtk.Align.END)
+        send_grid.attach(lbl_dest, 0, 1, 1, 1)
+
+        self._send_dest_entry = Gtk.Entry()
+        self._send_dest_entry.set_placeholder_text("/tmp/document.txt")
+        self._send_dest_entry.set_hexpand(True)
+        send_grid.attach(self._send_dest_entry, 1, 1, 1, 1)
+
+        self._send_btn = Gtk.Button(label="Send to dom0")
+        self._send_btn.set_tooltip_text(
+            "Copy the local file to dom0 through the secure command channel"
+        )
+        self._send_btn.connect("clicked", self._on_send_file)
+        ctx = self._send_btn.get_style_context()
+        ctx.add_class("suggested-action")
+        send_grid.attach(self._send_btn, 2, 1, 1, 1)
+
+        frame_send.add(send_grid)
+        vbox.pack_start(frame_send, False, False, 0)
+
+        # ── Fetch file from dom0 ─────────────────────────────
+        frame_fetch = create_frame("Fetch File from dom0")
+        fetch_grid = Gtk.Grid()
+        fetch_grid.set_column_spacing(8)
+        fetch_grid.set_row_spacing(8)
+        fetch_grid.set_margin_start(12)
+        fetch_grid.set_margin_end(12)
+        fetch_grid.set_margin_top(8)
+        fetch_grid.set_margin_bottom(8)
+
+        lbl_remote = Gtk.Label(label="Dom0 path:")
+        lbl_remote.set_halign(Gtk.Align.END)
+        fetch_grid.attach(lbl_remote, 0, 0, 1, 1)
+
+        self._fetch_remote_entry = Gtk.Entry()
+        self._fetch_remote_entry.set_placeholder_text("/tmp/result.log")
+        self._fetch_remote_entry.set_hexpand(True)
+        fetch_grid.attach(self._fetch_remote_entry, 1, 0, 1, 1)
+
+        lbl_save = Gtk.Label(label="Save as:")
+        lbl_save.set_halign(Gtk.Align.END)
+        fetch_grid.attach(lbl_save, 0, 1, 1, 1)
+
+        self._fetch_local_entry = Gtk.Entry()
+        self._fetch_local_entry.set_placeholder_text("/home/user/result.log")
+        self._fetch_local_entry.set_hexpand(True)
+        fetch_grid.attach(self._fetch_local_entry, 1, 1, 1, 1)
+
+        self._fetch_btn = Gtk.Button(label="Fetch from dom0")
+        self._fetch_btn.set_tooltip_text(
+            "Download a file from dom0 through the secure command channel"
+        )
+        self._fetch_btn.connect("clicked", self._on_fetch_file)
+        ctx = self._fetch_btn.get_style_context()
+        ctx.add_class("suggested-action")
+        fetch_grid.attach(self._fetch_btn, 2, 1, 1, 1)
+
+        frame_fetch.add(fetch_grid)
+        vbox.pack_start(frame_fetch, False, False, 0)
+
+        # ── Copy between VMs (via dom0) ──────────────────────
+        frame_copy = create_frame("Copy File Between VMs (via dom0)")
+        copy_grid = Gtk.Grid()
+        copy_grid.set_column_spacing(8)
+        copy_grid.set_row_spacing(8)
+        copy_grid.set_margin_start(12)
+        copy_grid.set_margin_end(12)
+        copy_grid.set_margin_top(8)
+        copy_grid.set_margin_bottom(8)
+
+        lbl_src_vm = Gtk.Label(label="Source VM:")
+        lbl_src_vm.set_halign(Gtk.Align.END)
+        copy_grid.attach(lbl_src_vm, 0, 0, 1, 1)
+
+        self._copy_src_vm = Gtk.Entry()
+        self._copy_src_vm.set_placeholder_text("source-vm")
+        self._copy_src_vm.set_hexpand(True)
+        copy_grid.attach(self._copy_src_vm, 1, 0, 1, 1)
+
+        lbl_src_path = Gtk.Label(label="Source path:")
+        lbl_src_path.set_halign(Gtk.Align.END)
+        copy_grid.attach(lbl_src_path, 0, 1, 1, 1)
+
+        self._copy_src_path = Gtk.Entry()
+        self._copy_src_path.set_placeholder_text("/home/user/file.txt")
+        self._copy_src_path.set_hexpand(True)
+        copy_grid.attach(self._copy_src_path, 1, 1, 1, 1)
+
+        lbl_dst_vm = Gtk.Label(label="Dest VM:")
+        lbl_dst_vm.set_halign(Gtk.Align.END)
+        copy_grid.attach(lbl_dst_vm, 2, 0, 1, 1)
+
+        self._copy_dst_vm = Gtk.Entry()
+        self._copy_dst_vm.set_placeholder_text("dest-vm")
+        copy_grid.attach(self._copy_dst_vm, 3, 0, 1, 1)
+
+        lbl_dst_path = Gtk.Label(label="Dest path:")
+        lbl_dst_path.set_halign(Gtk.Align.END)
+        copy_grid.attach(lbl_dst_path, 2, 1, 1, 1)
+
+        self._copy_dst_path = Gtk.Entry()
+        self._copy_dst_path.set_placeholder_text("/home/user/file.txt")
+        copy_grid.attach(self._copy_dst_path, 3, 1, 1, 1)
+
+        self._copy_btn = Gtk.Button(label="Copy Between VMs")
+        self._copy_btn.set_tooltip_text(
+            "Copy a file from one VM to another through dom0 "
+            "(uses qvm-run with pass-io, respects Qubes security)"
+        )
+        self._copy_btn.connect("clicked", self._on_copy_between_vms)
+        copy_grid.attach(self._copy_btn, 3, 2, 1, 1)
+
+        frame_copy.add(copy_grid)
+        vbox.pack_start(frame_copy, False, False, 0)
+
+        # ── Transfer output ──────────────────────────────────
+        self._files_output = OutputView()
+        self._files_output.set_min_content_height(100)
+        vbox.pack_start(self._files_output, True, True, 0)
+
+        # Info label about limits
+        info_lbl = Gtk.Label()
+        info_lbl.set_markup(
+            '<span size="small" foreground="#888888">'
+            "File transfers use the secure command channel (authenticated, "
+            "audited). Maximum file size: ~750 KB for send, ~7.5 MB for fetch. "
+            "For larger files, use the Execute tab with tar/split commands."
+            "</span>"
+        )
+        info_lbl.set_line_wrap(True)
+        info_lbl.set_halign(Gtk.Align.START)
+        vbox.pack_start(info_lbl, False, False, 0)
+
+        self._notebook.append_page(vbox, Gtk.Label(label="Files"))
+
+    def _on_send_browse(self, _btn):
+        dlg = Gtk.FileChooserDialog(
+            title="Select File to Send",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dlg.add_buttons(
+            "Cancel", Gtk.ResponseType.CANCEL,
+            "Open", Gtk.ResponseType.OK,
+        )
+        if dlg.run() == Gtk.ResponseType.OK:
+            filepath = dlg.get_filename()
+            self._send_local_entry.set_text(filepath)
+            if not self._send_dest_entry.get_text().strip():
+                self._send_dest_entry.set_text(f"/tmp/{os.path.basename(filepath)}")
+        dlg.destroy()
+
+    def _on_send_file(self, _btn):
+        local = self._send_local_entry.get_text().strip()
+        dest = self._send_dest_entry.get_text().strip()
+        if not local or not dest:
+            show_error_dialog(
+                self, "Missing Paths",
+                "Enter both a local file path and a dom0 destination path.",
+            )
+            return
+        if not os.path.isfile(local):
+            show_error_dialog(self, "File Not Found", f"Cannot find: {local}")
+            return
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+
+        size = os.path.getsize(local)
+        import base64
+        MAX_SEND = 750_000
+        if size > MAX_SEND:
+            show_error_dialog(
+                self, "File Too Large",
+                f"File is {format_file_size(size)}. "
+                f"Maximum for direct transfer: {format_file_size(MAX_SEND)}.\n\n"
+                "For larger files, use the Execute tab:\n"
+                "  base64 -d <<'EOF' > /path\n  <paste base64>\n  EOF\n\n"
+                "Or split the file and send chunks.",
+            )
+            return
+
+        self._files_output.clear()
+        self._files_output.append(
+            f"Sending {os.path.basename(local)} ({format_file_size(size)}) "
+            f"to dom0:{dest}...\n", "info",
+        )
+        self._send_btn.set_sensitive(False)
+        send_notification(
+            "Sending file to dom0",
+            f"{os.path.basename(local)} ({format_file_size(size)})",
+            icon=NOTIFY_ICON_TRANSFER,
+        )
+
+        try:
+            with open(local, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            self._files_output.append(f"Error reading file: {e}\n", "stderr")
+            self._send_btn.set_sensitive(True)
+            return
+
+        b64 = base64.b64encode(data).decode()
+        import shlex
+        safe_dest = shlex.quote(dest)
+        cmd = f"printf '%s' '{b64}' | base64 -d > {safe_dest}"
+
+        def _done(rc):
+            self._send_btn.set_sensitive(True)
+            if rc == 0:
+                self._files_output.append(
+                    f"File sent successfully to dom0:{dest}\n", "success",
+                )
+                send_notification(
+                    "File sent to dom0",
+                    f"{os.path.basename(local)} saved to {dest}",
+                    icon=NOTIFY_ICON_SUCCESS,
+                )
+            else:
+                self._files_output.append(
+                    f"Transfer failed (exit {rc})\n", "stderr",
+                )
+                send_notification(
+                    "File transfer failed",
+                    f"Could not send {os.path.basename(local)} (exit {rc})",
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+            return False
+
+        self._runner.run(
+            [self._qvm_remote, "-t", "120"],
+            stdin_data=cmd + "\n",
+            on_stdout=lambda t: self._files_output.append(t, "stdout"),
+            on_stderr=lambda t: self._files_output.append(t, "stderr"),
+            on_done=_done,
+        )
+
+    def _on_fetch_file(self, _btn):
+        remote = self._fetch_remote_entry.get_text().strip()
+        local = self._fetch_local_entry.get_text().strip()
+        if not remote or not local:
+            show_error_dialog(
+                self, "Missing Paths",
+                "Enter both a dom0 file path and a local save path.",
+            )
+            return
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+
+        self._files_output.clear()
+        self._files_output.append(
+            f"Fetching dom0:{remote}...\n", "info",
+        )
+        self._fetch_btn.set_sensitive(False)
+        send_notification(
+            "Fetching file from dom0",
+            f"{remote}",
+            icon=NOTIFY_ICON_TRANSFER,
+        )
+
+        import shlex
+        safe_remote = shlex.quote(remote)
+        cmd = f"base64 {safe_remote}"
+
+        def _fetch_thread():
+            import subprocess as sp
+            try:
+                r = sp.run(
+                    [self._qvm_remote, "-t", "120"],
+                    input=(cmd + "\n").encode(),
+                    capture_output=True,
+                    timeout=125,
+                )
+                rc = r.returncode
+                out = r.stdout.decode(errors="replace")
+                err = r.stderr.decode(errors="replace")
+            except Exception as e:
+                GLib.idle_add(self._files_output.append, f"Error: {e}\n", "stderr")
+                GLib.idle_add(self._fetch_btn.set_sensitive, True)
+                return
+
+            if rc != 0:
+                GLib.idle_add(
+                    self._files_output.append,
+                    f"Failed to fetch file (exit {rc}): {err}\n", "stderr",
+                )
+                GLib.idle_add(self._fetch_btn.set_sensitive, True)
+                send_notification(
+                    "File fetch failed",
+                    err.strip() or f"Exit code {rc}",
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+                return
+
+            import base64
+            try:
+                decoded = base64.b64decode(out.strip())
+            except Exception as e:
+                GLib.idle_add(
+                    self._files_output.append,
+                    f"Failed to decode file data: {e}\n", "stderr",
+                )
+                GLib.idle_add(self._fetch_btn.set_sensitive, True)
+                return
+
+            try:
+                with open(local, "wb") as f:
+                    f.write(decoded)
+                size_str = format_file_size(len(decoded))
+                GLib.idle_add(
+                    self._files_output.append,
+                    f"File saved to {local} ({size_str})\n", "success",
+                )
+                send_notification(
+                    "File received from dom0",
+                    f"Saved to {local} ({size_str})",
+                    icon=NOTIFY_ICON_SUCCESS,
+                )
+            except OSError as e:
+                GLib.idle_add(
+                    self._files_output.append,
+                    f"Error saving file: {e}\n", "stderr",
+                )
+            finally:
+                GLib.idle_add(self._fetch_btn.set_sensitive, True)
+
+        threading.Thread(target=_fetch_thread, daemon=True).start()
+
+    def _on_copy_between_vms(self, _btn):
+        src_vm = self._copy_src_vm.get_text().strip()
+        src_path = self._copy_src_path.get_text().strip()
+        dst_vm = self._copy_dst_vm.get_text().strip()
+        dst_path = self._copy_dst_path.get_text().strip()
+
+        if not all([src_vm, src_path, dst_vm, dst_path]):
+            show_error_dialog(
+                self, "Missing Information",
+                "Fill in all four fields: source VM, source path, "
+                "destination VM, and destination path.",
+            )
+            return
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+
+        if not show_confirm_dialog(
+            self,
+            "Copy File Between VMs?",
+            f"This will copy:\n"
+            f"  {src_vm}:{src_path}\n"
+            f"    to\n"
+            f"  {dst_vm}:{dst_path}\n\n"
+            f"The file passes through dom0. Both VMs must be running.\n"
+            f"This operation is logged in the audit trail.",
+        ):
+            return
+
+        self._files_output.clear()
+        self._files_output.append(
+            f"Copying {src_vm}:{src_path} to {dst_vm}:{dst_path}...\n", "info",
+        )
+        self._copy_btn.set_sensitive(False)
+        send_notification(
+            "Copying file between VMs",
+            f"{src_vm} to {dst_vm} (via dom0)",
+            icon=NOTIFY_ICON_TRANSFER,
+        )
+
+        import shlex
+        s_vm, s_path = shlex.quote(src_vm), shlex.quote(src_path)
+        d_vm, d_path = shlex.quote(dst_vm), shlex.quote(dst_path)
+        cmd = (
+            f"qvm-run --pass-io --no-gui {s_vm} 'cat {s_path}' | "
+            f"qvm-run --pass-io --no-gui {d_vm} 'cat > {d_path}'"
+        )
+
+        def _done(rc):
+            self._copy_btn.set_sensitive(True)
+            if rc == 0:
+                self._files_output.append(
+                    f"File copied successfully.\n", "success",
+                )
+                send_notification(
+                    "File copy completed",
+                    f"{src_vm}:{os.path.basename(src_path)} "
+                    f"copied to {dst_vm}:{dst_path}",
+                    icon=NOTIFY_ICON_SUCCESS,
+                )
+            else:
+                self._files_output.append(
+                    f"Copy failed (exit {rc})\n", "stderr",
+                )
+                send_notification(
+                    "File copy failed",
+                    f"Could not copy between {src_vm} and {dst_vm} (exit {rc})",
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+            return False
+
+        self._runner.run(
+            [self._qvm_remote, "-t", "300"],
+            stdin_data=cmd + "\n",
+            on_stdout=lambda t: self._files_output.append(t, "stdout"),
+            on_stderr=lambda t: self._files_output.append(t, "stderr"),
+            on_done=_done,
+        )
+
+    # ── Backup tab ──────────────────────────────────────────────────
+    # Local and remote backup of qvm-remote state (keys, history, audit).
+    # GitHub private repo integration for long-term disaster recovery.
+    # Change summary for quick review of what happened recently.
+
+    def _build_backup_tab(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_margin_start(12)
+        vbox.set_margin_end(12)
+        vbox.set_margin_top(12)
+        vbox.set_margin_bottom(12)
+
+        # ── Recent Changes ───────────────────────────────────
+        frame_changes = create_frame("Recent Changes")
+        changes_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        changes_box.set_margin_start(12)
+        changes_box.set_margin_end(12)
+        changes_box.set_margin_top(8)
+        changes_box.set_margin_bottom(8)
+
+        self._changes_view = OutputView()
+        self._changes_view.set_min_content_height(120)
+        changes_box.pack_start(self._changes_view, True, True, 0)
+
+        changes_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        refresh_changes_btn = Gtk.Button(label="Refresh Changes")
+        refresh_changes_btn.connect("clicked", lambda b: self._load_changes())
+        changes_btn_box.pack_start(refresh_changes_btn, False, False, 0)
+        changes_box.pack_start(changes_btn_box, False, False, 0)
+
+        frame_changes.add(changes_box)
+        vbox.pack_start(frame_changes, False, False, 0)
+
+        # ── Local Backup ─────────────────────────────────────
+        frame_local = create_frame("Local Backup")
+        local_grid = Gtk.Grid()
+        local_grid.set_column_spacing(8)
+        local_grid.set_row_spacing(8)
+        local_grid.set_margin_start(12)
+        local_grid.set_margin_end(12)
+        local_grid.set_margin_top(8)
+        local_grid.set_margin_bottom(8)
+
+        lbl_dir = Gtk.Label(label="Backup directory:")
+        lbl_dir.set_halign(Gtk.Align.END)
+        local_grid.attach(lbl_dir, 0, 0, 1, 1)
+
+        self._backup_dir_entry = Gtk.Entry()
+        default_backup_dir = str(Path.home() / "qvm-remote-backups")
+        self._backup_dir_entry.set_text(default_backup_dir)
+        self._backup_dir_entry.set_hexpand(True)
+        local_grid.attach(self._backup_dir_entry, 1, 0, 2, 1)
+
+        create_bak_btn = Gtk.Button(label="Create Backup Now")
+        create_bak_btn.set_tooltip_text(
+            "Back up keys, history, and audit log to a local archive"
+        )
+        create_bak_btn.connect("clicked", self._on_create_local_backup)
+        ctx = create_bak_btn.get_style_context()
+        ctx.add_class("suggested-action")
+        local_grid.attach(create_bak_btn, 0, 1, 1, 1)
+
+        # Existing backups combo
+        lbl_existing = Gtk.Label(label="Existing backups:")
+        lbl_existing.set_halign(Gtk.Align.END)
+        local_grid.attach(lbl_existing, 0, 2, 1, 1)
+
+        self._backup_combo = Gtk.ComboBoxText()
+        self._backup_combo.set_hexpand(True)
+        local_grid.attach(self._backup_combo, 1, 2, 1, 1)
+
+        restore_btn = Gtk.Button(label="Restore Selected")
+        restore_btn.set_tooltip_text(
+            "Restore from the selected backup archive"
+        )
+        restore_btn.connect("clicked", self._on_restore_local_backup)
+        ctx = restore_btn.get_style_context()
+        ctx.add_class("destructive-action")
+        local_grid.attach(restore_btn, 2, 2, 1, 1)
+
+        refresh_bak_btn = Gtk.Button(label="Refresh List")
+        refresh_bak_btn.connect("clicked", lambda b: self._refresh_backup_list())
+        local_grid.attach(refresh_bak_btn, 2, 1, 1, 1)
+
+        frame_local.add(local_grid)
+        vbox.pack_start(frame_local, False, False, 0)
+
+        # ── GitHub Backup ────────────────────────────────────
+        frame_git = create_frame("GitHub / Git Repository Backup")
+        git_grid = Gtk.Grid()
+        git_grid.set_column_spacing(8)
+        git_grid.set_row_spacing(8)
+        git_grid.set_margin_start(12)
+        git_grid.set_margin_end(12)
+        git_grid.set_margin_top(8)
+        git_grid.set_margin_bottom(8)
+
+        lbl_repo = Gtk.Label(label="Repository URL:")
+        lbl_repo.set_halign(Gtk.Align.END)
+        git_grid.attach(lbl_repo, 0, 0, 1, 1)
+
+        self._git_repo_entry = Gtk.Entry()
+        self._git_repo_entry.set_placeholder_text(
+            "git@github.com:username/qvm-remote-backup.git"
+        )
+        self._git_repo_entry.set_hexpand(True)
+        git_grid.attach(self._git_repo_entry, 1, 0, 2, 1)
+
+        # Load saved repo URL
+        repo_conf = DATA_DIR / "git-backup-url"
+        if repo_conf.exists():
+            try:
+                self._git_repo_entry.set_text(repo_conf.read_text().strip())
+            except OSError:
+                pass
+
+        push_git_btn = Gtk.Button(label="Push to Repository")
+        push_git_btn.set_tooltip_text(
+            "Push audit log, history, and key fingerprint to git "
+            "(full key is never uploaded)"
+        )
+        push_git_btn.connect("clicked", self._on_git_push)
+        ctx = push_git_btn.get_style_context()
+        ctx.add_class("suggested-action")
+        git_grid.attach(push_git_btn, 0, 1, 1, 1)
+
+        pull_git_btn = Gtk.Button(label="Pull from Repository")
+        pull_git_btn.set_tooltip_text(
+            "Pull the latest backup state from the remote repository"
+        )
+        pull_git_btn.connect("clicked", self._on_git_pull)
+        git_grid.attach(pull_git_btn, 1, 1, 1, 1)
+
+        git_info = Gtk.Label()
+        git_info.set_markup(
+            '<span size="small" foreground="#888888">'
+            "Only audit logs, command history, and key fingerprints are pushed. "
+            "Full authentication keys are never sent to the repository."
+            "</span>"
+        )
+        git_info.set_line_wrap(True)
+        git_info.set_halign(Gtk.Align.START)
+        git_grid.attach(git_info, 0, 2, 3, 1)
+
+        frame_git.add(git_grid)
+        vbox.pack_start(frame_git, False, False, 0)
+
+        # ── Dom0 Backup via qvm-remote ───────────────────────
+        frame_dom0 = create_frame("Dom0 System Backup (via qvm-remote)")
+        dom0_grid = Gtk.Grid()
+        dom0_grid.set_column_spacing(8)
+        dom0_grid.set_row_spacing(8)
+        dom0_grid.set_margin_start(12)
+        dom0_grid.set_margin_end(12)
+        dom0_grid.set_margin_top(8)
+        dom0_grid.set_margin_bottom(8)
+
+        self._dom0_backup_status = Gtk.Label()
+        self._dom0_backup_status.set_halign(Gtk.Align.START)
+        self._dom0_backup_status.set_markup(
+            '<span foreground="#888888">Click "Check" to view dom0 backup status</span>'
+        )
+        self._dom0_backup_status.set_line_wrap(True)
+        dom0_grid.attach(self._dom0_backup_status, 0, 0, 3, 1)
+
+        check_dom0_btn = Gtk.Button(label="Check Dom0 Backups")
+        check_dom0_btn.set_tooltip_text(
+            "Query dom0 for the latest backup date and available backup locations"
+        )
+        check_dom0_btn.connect("clicked", self._on_check_dom0_backups)
+        dom0_grid.attach(check_dom0_btn, 0, 1, 1, 1)
+
+        lbl_dest = Gtk.Label(label="Backup destination:")
+        lbl_dest.set_halign(Gtk.Align.END)
+        dom0_grid.attach(lbl_dest, 0, 2, 1, 1)
+
+        self._dom0_backup_dest = Gtk.Entry()
+        self._dom0_backup_dest.set_placeholder_text(
+            "/mnt/backup/ or /var/backups/"
+        )
+        self._dom0_backup_dest.set_hexpand(True)
+        dom0_grid.attach(self._dom0_backup_dest, 1, 2, 1, 1)
+
+        lbl_vms = Gtk.Label(label="VMs to back up:")
+        lbl_vms.set_halign(Gtk.Align.END)
+        dom0_grid.attach(lbl_vms, 0, 3, 1, 1)
+
+        self._dom0_backup_vms = Gtk.Entry()
+        self._dom0_backup_vms.set_placeholder_text(
+            "Leave empty for all VMs, or: work personal vault"
+        )
+        self._dom0_backup_vms.set_hexpand(True)
+        dom0_grid.attach(self._dom0_backup_vms, 1, 3, 1, 1)
+
+        start_dom0_bak = Gtk.Button(label="Start Dom0 Backup")
+        start_dom0_bak.set_tooltip_text(
+            "Run qvm-backup in dom0 through qvm-remote (long operation)"
+        )
+        start_dom0_bak.connect("clicked", self._on_start_dom0_backup)
+        ctx = start_dom0_bak.get_style_context()
+        ctx.add_class("suggested-action")
+        dom0_grid.attach(start_dom0_bak, 2, 3, 1, 1)
+
+        frame_dom0.add(dom0_grid)
+        vbox.pack_start(frame_dom0, False, False, 0)
+
+        # ── Backup output ────────────────────────────────────
+        self._backup_output = OutputView()
+        self._backup_output.set_min_content_height(100)
+        vbox.pack_start(self._backup_output, True, True, 0)
+
+        scroll.add(vbox)
+        self._notebook.append_page(scroll, Gtk.Label(label="Backup"))
+
+    def _load_changes(self):
+        self._changes_view.clear()
+        changes = get_change_summary(DATA_DIR)
+        if not changes:
+            self._changes_view.append("No recent changes recorded.\n", "info")
+            return
+        for ts, etype, desc in changes:
+            tag = "stdout"
+            if etype == "error":
+                tag = "stderr"
+            elif etype == "result":
+                tag = "success"
+            elif etype in ("command", "key"):
+                tag = "info"
+            line = f"[{ts}] " if ts else ""
+            line += desc
+            self._changes_view.append(line + "\n", tag)
+
+    def _refresh_backup_list(self):
+        self._backup_combo.remove_all()
+        bdir = self._backup_dir_entry.get_text().strip()
+        if not bdir:
+            return
+        backups = list_local_backups(bdir)
+        for path, size, mtime in backups:
+            label = f"{os.path.basename(path)} ({size}, {mtime})"
+            self._backup_combo.append(path, label)
+        if backups:
+            self._backup_combo.set_active(0)
+
+    def _on_create_local_backup(self, _btn):
+        bdir = self._backup_dir_entry.get_text().strip()
+        if not bdir:
+            show_error_dialog(self, "No Directory", "Enter a backup directory path.")
+            return
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+        dest = os.path.join(bdir, f"qvm-remote-backup-{ts}.tar.gz")
+
+        self._backup_output.clear()
+        self._backup_output.append(f"Creating backup: {dest}...\n", "info")
+
+        def _do():
+            ok, msg = create_local_backup(DATA_DIR, dest)
+            tag = "success" if ok else "stderr"
+            GLib.idle_add(self._backup_output.append, msg + "\n", tag)
+            GLib.idle_add(self._refresh_backup_list)
+            if ok:
+                send_notification(
+                    "Backup created",
+                    msg,
+                    icon=NOTIFY_ICON_BACKUP,
+                )
+            else:
+                send_notification(
+                    "Backup failed",
+                    msg,
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_restore_local_backup(self, _btn):
+        active_id = self._backup_combo.get_active_id()
+        if not active_id:
+            show_error_dialog(
+                self, "No Backup Selected",
+                "Select a backup archive from the list.",
+            )
+            return
+        if not show_confirm_dialog(
+            self,
+            "Restore from Backup?",
+            f"This will overwrite the current qvm-remote state with:\n"
+            f"  {os.path.basename(active_id)}\n\n"
+            "A safety backup of the current state will be created first.\n"
+            "Are you sure?",
+        ):
+            return
+
+        self._backup_output.clear()
+        self._backup_output.append(
+            f"Restoring from {os.path.basename(active_id)}...\n", "info",
+        )
+
+        def _do():
+            # Safety backup first
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+            safety = str(DATA_DIR.parent / f"qvm-remote-pre-restore-{ts}.tar.gz")
+            ok_s, msg_s = create_local_backup(DATA_DIR, safety)
+            if ok_s:
+                GLib.idle_add(
+                    self._backup_output.append,
+                    f"Safety backup: {safety}\n", "info",
+                )
+            ok, msg = restore_local_backup(active_id, str(DATA_DIR.parent))
+            tag = "success" if ok else "stderr"
+            GLib.idle_add(self._backup_output.append, msg + "\n", tag)
+            if ok:
+                send_notification(
+                    "Backup restored",
+                    msg,
+                    icon=NOTIFY_ICON_BACKUP,
+                )
+            else:
+                send_notification(
+                    "Restore failed",
+                    msg,
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_git_push(self, _btn):
+        repo = self._git_repo_entry.get_text().strip()
+        if not repo:
+            show_error_dialog(
+                self, "No Repository URL",
+                "Enter a git repository URL (e.g. git@github.com:user/backup.git).",
+            )
+            return
+
+        # Save URL for next time
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            (DATA_DIR / "git-backup-url").write_text(repo + "\n")
+        except OSError:
+            pass
+
+        self._backup_output.clear()
+        self._backup_output.append(f"Pushing to {repo}...\n", "info")
+
+        def _do():
+            ok, msg = git_backup_push(DATA_DIR, repo)
+            tag = "success" if ok else "stderr"
+            GLib.idle_add(self._backup_output.append, msg + "\n", tag)
+            if ok:
+                send_notification(
+                    "Backup pushed to repository",
+                    msg,
+                    icon=NOTIFY_ICON_BACKUP,
+                )
+            else:
+                send_notification(
+                    "Git backup push failed",
+                    msg,
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_git_pull(self, _btn):
+        repo = self._git_repo_entry.get_text().strip()
+        if not repo:
+            show_error_dialog(
+                self, "No Repository URL",
+                "Enter a git repository URL.",
+            )
+            return
+
+        backup_dir = DATA_DIR / "git-backup"
+        self._backup_output.clear()
+        self._backup_output.append(f"Pulling from {repo}...\n", "info")
+
+        def _do():
+            ok, msg = git_backup_pull(repo, backup_dir)
+            tag = "success" if ok else "stderr"
+            GLib.idle_add(self._backup_output.append, msg + "\n", tag)
+            if ok:
+                # Show what we got
+                meta = backup_dir / "backup-meta.txt"
+                if meta.exists():
+                    try:
+                        GLib.idle_add(
+                            self._backup_output.append,
+                            "--- Backup metadata ---\n" + meta.read_text() + "\n",
+                            "info",
+                        )
+                    except OSError:
+                        pass
+                send_notification(
+                    "Backup pulled from repository",
+                    msg,
+                    icon=NOTIFY_ICON_BACKUP,
+                )
+            else:
+                send_notification(
+                    "Git backup pull failed",
+                    msg,
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_check_dom0_backups(self, _btn):
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+        self._dom0_backup_status.set_markup(
+            '<span foreground="#e79e27">Checking...</span>'
+        )
+        self._backup_output.clear()
+        self._backup_output.append("Querying dom0 for backup information...\n", "info")
+
+        def _do():
+            cmd = (
+                'echo "=== Last Qubes Backup ===" ; '
+                'ls -lt /var/backups/qubes-backup-*.gz 2>/dev/null | head -5 || '
+                'echo "No backups found in /var/backups/" ; '
+                'echo "" ; '
+                'echo "=== Backup Locations ===" ; '
+                'for d in /var/backups /mnt/backup /mnt/usb; do '
+                '  if [ -d "$d" ]; then '
+                '    used=$(df -h "$d" 2>/dev/null | tail -1 | awk "{print \\$3}") ; '
+                '    avail=$(df -h "$d" 2>/dev/null | tail -1 | awk "{print \\$4}") ; '
+                '    echo "  $d: used=$used avail=$avail" ; '
+                '  fi ; '
+                'done ; '
+                'echo "" ; '
+                'echo "=== qvm-remote Service Config ===" ; '
+                'cat /etc/qubes/remote.conf 2>/dev/null || echo "(no config)" ; '
+                'echo "" ; '
+                'echo "=== Authorized VMs ===" ; '
+                'ls /etc/qubes/remote.d/*.key 2>/dev/null | '
+                'while read f; do echo "  $(basename "$f" .key)"; done || '
+                'echo "(none)"'
+            )
+            import subprocess as sp
+            try:
+                r = sp.run(
+                    [self._qvm_remote, "-t", "30"],
+                    input=(cmd + "\n").encode(),
+                    capture_output=True,
+                    timeout=35,
+                )
+                rc = r.returncode
+                out = r.stdout.decode(errors="replace")
+                err = r.stderr.decode(errors="replace")
+            except FileNotFoundError:
+                GLib.idle_add(
+                    self._backup_output.append,
+                    "Error: qvm-remote not found in PATH\n", "stderr",
+                )
+                return
+            except Exception as e:
+                GLib.idle_add(
+                    self._backup_output.append,
+                    f"Error: {e}\n", "stderr",
+                )
+                return
+
+            if rc == 0:
+                GLib.idle_add(self._backup_output.append, out, "stdout")
+                # Try to extract last backup date
+                for line in out.splitlines():
+                    if "qubes-backup" in line and ".gz" in line:
+                        GLib.idle_add(
+                            self._dom0_backup_status.set_markup,
+                            f'<span foreground="#5ad840">Last backup: {line.strip()[:60]}</span>',
+                        )
+                        break
+                else:
+                    GLib.idle_add(
+                        self._dom0_backup_status.set_markup,
+                        '<span foreground="#e79e27">No dom0 backups found</span>',
+                    )
+            else:
+                GLib.idle_add(
+                    self._backup_output.append,
+                    f"Failed (exit {rc}): {err}\n", "stderr",
+                )
+                GLib.idle_add(
+                    self._dom0_backup_status.set_markup,
+                    '<span foreground="#bd2727">Could not check dom0 backups</span>',
+                )
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_start_dom0_backup(self, _btn):
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+        dest = self._dom0_backup_dest.get_text().strip()
+        if not dest:
+            show_error_dialog(
+                self, "No Destination",
+                "Enter a dom0 backup destination path (e.g. /mnt/backup/).",
+            )
+            return
+        vms = self._dom0_backup_vms.get_text().strip()
+        desc = f"Destination: {dest}"
+        if vms:
+            desc += f"\nVMs: {vms}"
+        else:
+            desc += "\nAll VMs with include_in_backups=True"
+
+        if not show_confirm_dialog(
+            self,
+            "Start Dom0 Backup?",
+            f"This will start a full Qubes backup in dom0.\n\n{desc}\n\n"
+            "This operation can take a long time (minutes to hours) "
+            "depending on the amount of data.\n\n"
+            "The backup is encrypted and compressed.",
+        ):
+            return
+
+        self._backup_output.clear()
+        self._backup_output.append(f"Starting dom0 backup to {dest}...\n", "info")
+        send_notification(
+            "Dom0 backup starting",
+            desc,
+            icon=NOTIFY_ICON_BACKUP,
+        )
+
+        import shlex
+        safe_dest = shlex.quote(dest)
+        if vms:
+            vm_args = " ".join(shlex.quote(v) for v in vms.split())
+            cmd = f"qvm-backup --yes {safe_dest} {vm_args}"
+        else:
+            cmd = f"qvm-backup --yes {safe_dest}"
+
+        def _done(rc):
+            if rc == 0:
+                self._backup_output.append(
+                    "\nDom0 backup completed successfully.\n", "success",
+                )
+                send_notification(
+                    "Dom0 backup completed",
+                    f"Backup saved to {dest}",
+                    icon=NOTIFY_ICON_SUCCESS,
+                )
+            else:
+                self._backup_output.append(
+                    f"\nDom0 backup failed (exit {rc})\n", "stderr",
+                )
+                send_notification(
+                    "Dom0 backup failed",
+                    f"Exit code {rc}",
+                    icon=NOTIFY_ICON_ERROR, urgency="critical",
+                )
+            return False
+
+        self._runner.run(
+            [self._qvm_remote, "-t", "7200"],
+            stdin_data=cmd + "\n",
+            on_stdout=lambda t: self._backup_output.append(t, "stdout"),
+            on_stderr=lambda t: self._backup_output.append(t, "stderr"),
+            on_done=_done,
+        )
+
+    # ── History tab ─────────────────────────────────────────────────
+
+    def _build_history_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_margin_start(10)
+        vbox.set_margin_end(10)
+        vbox.set_margin_top(10)
+        vbox.set_margin_bottom(10)
+
+        # Controls
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        self._hist_search = Gtk.SearchEntry()
+        self._hist_search.set_placeholder_text("Filter commands...")
+        self._hist_search.connect("search-changed", self._on_hist_filter)
+        hbox.pack_start(self._hist_search, True, True, 0)
+
+        refresh_btn = Gtk.Button(label="Refresh")
+        refresh_btn.connect("clicked", lambda b: self._load_history())
+        hbox.pack_start(refresh_btn, False, False, 0)
+
+        rerun_btn = Gtk.Button(label="Re-run Selected")
+        rerun_btn.connect("clicked", self._on_hist_rerun)
+        hbox.pack_start(rerun_btn, False, False, 0)
+
+        vbox.pack_start(hbox, False, False, 0)
+
+        # TreeView: ID, Exit, Duration, Command (visible), full command (hidden)
+        self._hist_store = Gtk.ListStore(str, str, str, str, str)
+        self._hist_filter = self._hist_store.filter_new()
+        self._hist_filter.set_visible_func(self._hist_filter_func)
+
+        self._hist_sort = Gtk.TreeModelSort(model=self._hist_filter)
+        self._hist_sort.set_sort_column_id(0, Gtk.SortType.DESCENDING)
+
+        self._hist_tree = Gtk.TreeView(model=self._hist_sort)
+        self._hist_tree.set_headers_visible(True)
+        self._hist_tree.set_enable_search(True)
+        self._hist_tree.connect("row-activated", self._on_hist_activated)
+
+        for i, (title, width) in enumerate(
+            [("ID", 220), ("Exit", 60), ("Duration", 90), ("Command", 350)]
+        ):
+            renderer = Gtk.CellRendererText()
+            if i == 3:
+                renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            col.set_min_width(width)
+            col.set_sort_column_id(i)
+            self._hist_tree.append_column(col)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+        scroll.add(self._hist_tree)
+        vbox.pack_start(scroll, True, True, 0)
+
+        self._notebook.append_page(vbox, Gtk.Label(label="History"))
+
+        # Load on tab switch
+        self._notebook.connect("switch-page", self._on_tab_switch)
+
+    def _load_history(self):
+        self._hist_store.clear()
+        if not HISTORY_DIR.exists():
+            return
+        try:
+            dirs = sorted(HISTORY_DIR.glob("*/*"), reverse=True)[:200]
+        except OSError:
+            return
+        for d in dirs:
+            try:
+                rc = (d / "exit").read_text().strip() if (d / "exit").exists() else "-"
+                dur = "-"
+                if (d / "meta").exists():
+                    for line in (d / "meta").read_text().splitlines():
+                        if line.startswith("duration_ms="):
+                            dur = line.split("=", 1)[1] + " ms"
+                cmd_short = cmd_full = ""
+                if (d / "command").exists():
+                    cmd_full = (d / "command").read_text().strip()
+                    cmd_short = cmd_full[:120].replace("\n", " ")
+                self._hist_store.append([d.name, rc, dur, cmd_short, cmd_full])
+            except OSError:
+                continue
+
+    def _hist_filter_func(self, model, tree_iter, data=None):
+        query = self._hist_search.get_text().lower()
+        if not query:
+            return True
+        row_text = " ".join(str(model[tree_iter][i]) for i in range(5))
+        return query in row_text.lower()
+
+    def _on_hist_filter(self, _entry):
+        self._hist_filter.refilter()
+
+    def _on_hist_rerun(self, _btn):
+        sel = self._hist_tree.get_selection()
+        model, tree_iter = sel.get_selected()
+        if tree_iter:
+            cmd = model[tree_iter][4]
+            if cmd:
+                self._cmd_view.get_buffer().set_text(cmd)
+                self._notebook.set_current_page(0)
+
+    def _on_hist_activated(self, tree, path, col):
+        self._on_hist_rerun(None)
+
+    # ── Keys tab ────────────────────────────────────────────────────
+
+    def _build_keys_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_start(20)
+        vbox.set_margin_end(20)
+        vbox.set_margin_top(20)
+        vbox.set_margin_bottom(20)
+
+        # Key status section
+        frame = create_frame("Authentication Key")
+        fbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        fbox.set_margin_start(12)
+        fbox.set_margin_end(12)
+        fbox.set_margin_top(8)
+        fbox.set_margin_bottom(8)
+
+        self._key_status = StatusIndicator("Checking...", "inactive")
+        fbox.pack_start(self._key_status, False, False, 0)
+
+        row, self._key_fingerprint = create_info_row("Fingerprint:", "")
+        self._key_fingerprint.get_style_context().add_class("qvm-key-text")
+        fbox.pack_start(row, False, False, 0)
+
+        row, self._key_path = create_info_row("Key file:", str(KEY_FILE))
+        fbox.pack_start(row, False, False, 0)
+
+        frame.add(fbox)
+        vbox.pack_start(frame, False, False, 0)
+
+        # Actions
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        gen_btn = Gtk.Button(label="Generate New Key")
+        gen_btn.set_tooltip_text("Create a new 256-bit authentication key")
+        gen_btn.connect("clicked", self._on_key_gen)
+        btn_box.pack_start(gen_btn, False, False, 0)
+
+        show_btn = Gtk.Button(label="Show Key")
+        show_btn.set_tooltip_text("Display the full key (for registering in dom0)")
+        show_btn.connect("clicked", self._on_key_show)
+        btn_box.pack_start(show_btn, False, False, 0)
+
+        import_btn = Gtk.Button(label="Import Key")
+        import_btn.set_tooltip_text("Import an existing hex key")
+        import_btn.connect("clicked", self._on_key_import)
+        btn_box.pack_start(import_btn, False, False, 0)
+
+        vbox.pack_start(btn_box, False, False, 0)
+
+        # Connection test section
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        vbox.pack_start(sep, False, False, 4)
+
+        frame2 = create_frame("Connection Test")
+        fbox2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        fbox2.set_margin_start(12)
+        fbox2.set_margin_end(12)
+        fbox2.set_margin_top(8)
+        fbox2.set_margin_bottom(8)
+
+        self._ping_status = StatusIndicator("Not tested", "inactive")
+        fbox2.pack_start(self._ping_status, False, False, 0)
+
+        ping_btn = Gtk.Button(label="Test Connection")
+        ping_btn.set_tooltip_text("Send a ping to check if dom0 is responding")
+        ping_btn.connect("clicked", self._on_ping)
+        fbox2.pack_start(ping_btn, False, False, 0)
+
+        frame2.add(fbox2)
+        vbox.pack_start(frame2, False, False, 0)
+
+        # Fill remaining space
+        vbox.pack_start(Gtk.Box(), True, True, 0)
+
+        self._notebook.append_page(vbox, Gtk.Label(label="Keys"))
+
+    def _refresh_key_status(self):
+        if KEY_FILE.exists():
+            try:
+                key = KEY_FILE.read_text().strip()
+                masked = key[:8] + "..." + key[-8:] if len(key) >= 16 else "***"
+                self._key_status.set_state("active", "Key configured")
+                self._key_fingerprint.set_text(masked)
+            except OSError:
+                self._key_status.set_state("warning", "Key file unreadable")
+                self._key_fingerprint.set_text("")
+        else:
+            self._key_status.set_state("inactive", "No key configured")
+            self._key_fingerprint.set_text("")
+
+    def _on_key_gen(self, _btn):
+        if KEY_FILE.exists():
+            if not show_confirm_dialog(
+                self,
+                "Replace Existing Key?",
+                "A key already exists. Generating a new key will invalidate "
+                "the current dom0 registration. You will need to re-authorize "
+                "this VM in dom0.\n\nContinue?",
+            ):
+                return
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+        rc, out, err = run_quick([self._qvm_remote, "key", "gen"])
+        if rc == 0:
+            show_info_dialog(
+                self,
+                "Key Generated",
+                f"New key generated.\n\n"
+                f"Register in dom0 with:\n{err.strip()}\n\n"
+                f"Key: {out.strip()[:16]}...",
+            )
+            self._refresh_key_status()
+            send_notification(
+                "Authentication key generated",
+                "Register this key in dom0 to enable remote commands.",
+                icon=NOTIFY_ICON_SECURITY,
+            )
+        else:
+            show_error_dialog(self, "Key Generation Failed", err or "Unknown error")
+            send_notification(
+                "Key generation failed",
+                err.strip() or "Unknown error",
+                icon=NOTIFY_ICON_ERROR, urgency="critical",
+            )
+
+    def _on_key_show(self, _btn):
+        if not self._qvm_remote:
+            show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            return
+        rc, out, err = run_quick([self._qvm_remote, "key", "show"])
+        if rc == 0:
+            dlg = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="Authentication Key",
+            )
+            dlg.format_secondary_text(
+                f"{out.strip()}\n\n"
+                f"Register in dom0 with:\n"
+                f"  qvm-remote-dom0 authorize VMNAME {out.strip()[:16]}..."
+            )
+            dlg.run()
+            dlg.destroy()
+        else:
+            show_error_dialog(self, "No Key Found", err or "No key configured.")
+
+    def _on_key_import(self, _btn):
+        dlg = Gtk.Dialog(
+            title="Import Authentication Key",
+            transient_for=self,
+            modal=True,
+        )
+        dlg.add_buttons(
+            "Cancel", Gtk.ResponseType.CANCEL,
+            "OK", Gtk.ResponseType.OK,
+        )
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+
+        lbl = Gtk.Label(label="Enter 256-bit hex key (64 characters):")
+        lbl.set_halign(Gtk.Align.START)
+        box.add(lbl)
+
+        entry = Gtk.Entry()
+        entry.set_max_length(64)
+        entry.set_placeholder_text("64 hex characters")
+        entry.set_width_chars(68)
+        box.add(entry)
+        box.show_all()
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            key_text = entry.get_text().strip()
+            if not self._qvm_remote:
+                show_error_dialog(self, "Tool Not Found", "qvm-remote not found.")
+            elif not valid_hex_key(key_text):
+                show_error_dialog(
+                    self,
+                    "Invalid Key",
+                    "Key must be exactly 64 hexadecimal characters (0-9, a-f).",
+                )
+            else:
+                rc, out, err = run_quick(
+                    [self._qvm_remote, "key", "import", key_text]
+                )
+                if rc == 0:
+                    show_info_dialog(self, "Key Imported", out or "Key imported successfully.")
+                    self._refresh_key_status()
+                    send_notification(
+                        "Authentication key imported",
+                        "Key is ready. Register in dom0 to activate.",
+                        icon=NOTIFY_ICON_SECURITY,
+                    )
+                else:
+                    show_error_dialog(self, "Import Failed", err or "Unknown error")
+        dlg.destroy()
+
+    def _on_ping(self, _btn):
+        self._ping_status.set_state("warning", "Testing...")
+        if not self._qvm_remote:
+            self._ping_status.set_state("error", "qvm-remote not found")
+            return
+
+        def _do_ping():
+            t0 = time.monotonic()
+            rc, out, err = run_quick([self._qvm_remote, "ping"], timeout=15)
+            elapsed = time.monotonic() - t0
+            if rc == 0:
+                GLib.idle_add(
+                    self._ping_status.set_state,
+                    "active",
+                    f"Connected ({elapsed:.1f}s)",
+                )
+                GLib.idle_add(
+                    self._conn_status.set_state,
+                    "active",
+                    f"Connected ({elapsed:.1f}s)",
+                )
+                send_notification(
+                    "Dom0 connection active",
+                    f"Response time: {elapsed:.1f}s",
+                    icon=NOTIFY_ICON_NETWORK,
+                )
+            else:
+                GLib.idle_add(
+                    self._ping_status.set_state,
+                    "error",
+                    f"Not responding ({err.strip() or 'timeout'})",
+                )
+                GLib.idle_add(
+                    self._conn_status.set_state, "error", "Not responding"
+                )
+                send_notification(
+                    "Dom0 not responding",
+                    err.strip() or "Connection timed out",
+                    icon=NOTIFY_ICON_WARNING,
+                    urgency="critical",
+                )
+
+        threading.Thread(target=_do_ping, daemon=True).start()
+
+    # ── Log tab ─────────────────────────────────────────────────────
+
+    def _build_log_tab(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_margin_start(10)
+        vbox.set_margin_end(10)
+        vbox.set_margin_top(10)
+        vbox.set_margin_bottom(10)
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        self._log_search = Gtk.SearchEntry()
+        self._log_search.set_placeholder_text("Search log...")
+        self._log_search.connect("search-changed", self._on_log_search)
+        hbox.pack_start(self._log_search, True, True, 0)
+
+        refresh_btn = Gtk.Button(label="Refresh")
+        refresh_btn.connect("clicked", lambda b: self._load_log())
+        hbox.pack_start(refresh_btn, False, False, 0)
+
+        auto_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self._log_auto = Gtk.CheckButton(label="Auto-refresh")
+        self._log_auto.set_active(False)
+        self._log_auto.connect("toggled", self._on_log_auto_toggle)
+        auto_box.pack_start(self._log_auto, False, False, 0)
+        hbox.pack_start(auto_box, False, False, 0)
+
+        vbox.pack_start(hbox, False, False, 0)
+
+        self._log_view = OutputView()
+        vbox.pack_start(self._log_view, True, True, 0)
+
+        self._notebook.append_page(vbox, Gtk.Label(label="Log"))
+        self._log_timer_id = None
+
+    def _load_log(self):
+        self._log_view.clear()
+        if not LOG_FILE.exists():
+            self._log_view.append("No audit log entries yet.\n", "info")
+            return
+        try:
+            lines = LOG_FILE.read_text().splitlines()
+            query = self._log_search.get_text().lower()
+            for line in lines[-500:]:
+                if query and query not in line.lower():
+                    continue
+                self._log_view.append(line + "\n", "stdout")
+        except OSError as e:
+            self._log_view.append(f"Error reading log: {e}\n", "stderr")
+
+    def _on_log_search(self, _entry):
+        self._load_log()
+
+    def _on_log_auto_toggle(self, btn):
+        if btn.get_active():
+            self._log_timer_id = GLib.timeout_add_seconds(5, self._log_auto_refresh)
+        elif self._log_timer_id:
+            GLib.source_remove(self._log_timer_id)
+            self._log_timer_id = None
+
+    def _log_auto_refresh(self):
+        if self._log_auto.get_active() and self._notebook.get_current_page() == 5:
+            self._load_log()
+        return self._log_auto.get_active()
+
+    # ── Tab switch handler ──────────────────────────────────────────
+
+    def _on_tab_switch(self, notebook, page, page_num):
+        if page_num == 2:
+            self._load_changes()
+            self._refresh_backup_list()
+        elif page_num == 3:
+            self._load_history()
+        elif page_num == 4:
+            self._refresh_key_status()
+        elif page_num == 5:
+            self._load_log()
+
+    # ── Connection check (background) ───────────────────────────────
+
+    def _check_connection_async(self):
+        if not self._qvm_remote:
+            self._conn_status.set_state("error", "qvm-remote not found")
+            return False
+        self._conn_status.set_state("warning", "Checking...")
+
+        def _check():
+            rc, _, _ = run_quick([self._qvm_remote, "ping"], timeout=12)
+            if rc == 0:
+                GLib.idle_add(
+                    self._conn_status.set_state, "active", "Connected"
+                )
+            else:
+                GLib.idle_add(
+                    self._conn_status.set_state, "inactive", "Not connected"
+                )
+
+        threading.Thread(target=_check, daemon=True).start()
+        return False  # one-shot
+
+
+# ── Application ─────────────────────────────────────────────────────
+
+
+class QvmRemoteApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        apply_css()
+        win = QvmRemoteWindow(self)
+        win.show_all()
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+
+
+def main():
+    app = QvmRemoteApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

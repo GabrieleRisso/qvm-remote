@@ -2,8 +2,10 @@ host:
   rpm:
     build:
     - rpm_spec/qvm-remote-dom0.spec
+    - rpm_spec/qvm-remote-gui-dom0.spec
 
 vm:
   rpm:
     build:
     - rpm_spec/qvm-remote-vm.spec
+    - rpm_spec/qvm-remote-gui-vm.spec

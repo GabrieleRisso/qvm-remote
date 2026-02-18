@@ -1,0 +1,18 @@
+qvm-remote (1.1.0-1) unstable; urgency=medium
+
+  * Add root privilege checks to dom0 daemon with clear error messages.
+  * Fix systemctl return code checking in enable/disable commands.
+  * Add troubleshooting hints to ping failure output.
+  * Validate timeout flag input (reject non-integer, zero, negative).
+  * Catch PermissionError gracefully in both client and daemon.
+  * GTK3 GUI for VM client and dom0 daemon.
+
+ -- qvm-remote contributors <qvm-remote@users.noreply.github.com>  Tue, 18 Feb 2026 01:00:00 +0000
+
+qvm-remote (1.0.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * VM client CLI tool (qvm-remote).
+  * Dom0 executor daemon (qvm-remote-dom0).
+
+ -- qvm-remote contributors <qvm-remote@users.noreply.github.com>  Tue, 18 Feb 2026 00:00:00 +0000

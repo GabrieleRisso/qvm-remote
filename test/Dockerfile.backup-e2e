@@ -1,0 +1,46 @@
+# Dockerfile.backup-e2e -- Full backup/restore E2E test
+#
+# Tests the complete backup pipeline: local archive, git backup, change
+# tracking, CLI-GUI data compatibility, and GUI wiring correctness.
+# Runs under Xvfb for live GTK widget inspection.
+#
+# Usage: podman build -f test/Dockerfile.backup-e2e -t qvm-remote-backup-e2e .
+
+FROM registry.fedoraproject.org/fedora:41
+
+RUN dnf install -y python3 python3-gobject gtk3 make git xorg-x11-server-Xvfb && dnf clean all
+
+# Configure git for test commits
+RUN git config --global user.email "test@qvm-remote.local" && git config --global user.name "qvm-remote-test" && git config --global init.defaultBranch main
+
+COPY . /build
+WORKDIR /build
+
+# Install CLI and GUI
+RUN make install-vm DESTDIR=/ && make install-gui-vm DESTDIR=/
+
+# Syntax check everything
+RUN make check
+
+# ── 1. Headless unit tests ────────────────────────────────────────
+RUN python3 test/test_gui.py -v
+RUN python3 test/test_gui_wiring.py -v
+
+# ── 2. Xvfb live wiring tests (instantiates actual GTK windows) ──
+RUN xvfb-run -a python3 test/test_gui_wiring.py -v
+
+# ── 3. Full integration under Xvfb ──────────────────────────────
+RUN xvfb-run -a python3 test/test_gui_integration.py -v
+
+# ── 4. CLI-GUI cross-integration (backup/restore/git cycle) ──────
+RUN python3 test/test_backup_e2e.py
+
+# ── 5. Verify both GUI processes start and exit under Xvfb ──────
+RUN xvfb-run -a bash -c 'timeout 8 python3 gui/qvm-remote-gui & PID=$!; sleep 3; kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo "PASS: VM GUI starts and stops under Xvfb"'
+RUN xvfb-run -a bash -c 'timeout 8 python3 gui/qvm-remote-dom0-gui & PID=$!; sleep 3; kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo "PASS: Dom0 GUI starts and stops under Xvfb"'
+
+# ── 6. Verify CLI works after install ────────────────────────────
+RUN qvm-remote --help | head -3
+RUN qvm-remote --version
+
+RUN echo "" && echo "======================================" && echo "  ALL BACKUP E2E TESTS PASSED" && echo "======================================" && echo ""

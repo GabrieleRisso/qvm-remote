@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Qubes Remote Service Manager
+Comment=Manage the qvm-remote dom0 command executor
+Exec=pkexec /usr/bin/qvm-remote-dom0-gui
+Icon=preferences-system
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=qubes;remote;dom0;service;
+StartupNotify=true

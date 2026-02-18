@@ -97,7 +97,8 @@ assert_contains "help_shows_timeout_option" "$HELP_OUT" "--timeout"
 
 VERSION_OUT=$(qvm-remote --version 2>&1)
 assert_contains "version_shows_qvm_remote_prefix" "$VERSION_OUT" "qvm-remote"
-assert_contains "version_shows_semver" "$VERSION_OUT" "1.0.0"
+EXPECTED_VER=$(cat /build/version 2>/dev/null || echo "1.1.0")
+assert_contains "version_shows_semver" "$VERSION_OUT" "$EXPECTED_VER"
 
 # Short flags
 HELP_SHORT=$(qvm-remote -h 2>&1)

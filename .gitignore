@@ -6,6 +6,10 @@ pkgs/
 *.tar.gz
 *.tar.xz
 
+__pycache__/
+*.pyc
+*.pyo
+
 *.swp
 *.swo
 *~
@@ -16,6 +20,7 @@ pkgs/
 
 # Runtime data (never commit)
 .qubes-remote/
+.qvm-remote/
 
 # GPG private keys (public .asc keys ARE tracked)
 keys/*.gpg

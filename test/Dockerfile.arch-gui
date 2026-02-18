@@ -1,0 +1,42 @@
+# Dockerfile.arch-gui -- Arch Linux GUI build and test
+#
+# Tests that the GUI installs correctly on Arch Linux and the shared
+# module works with Arch's Python/GTK3 packages.
+#
+# Usage: podman build -f test/Dockerfile.arch-gui -t qvm-remote-arch-gui-test .
+
+FROM archlinux:latest
+
+RUN pacman -Sy --noconfirm python python-gobject gtk3 make
+
+COPY . /build
+WORKDIR /build
+
+# Syntax check
+RUN make check
+
+# Install CLI client
+RUN make install-vm DESTDIR=/
+
+# Install GUI
+RUN make install-gui-vm DESTDIR=/
+
+# Verify placement
+RUN test -x /usr/bin/qvm-remote && echo "PASS: qvm-remote binary"
+RUN test -x /usr/bin/qvm-remote-gui && echo "PASS: qvm-remote-gui binary"
+RUN test -f /usr/lib/qvm-remote/qubes_remote_ui.py && echo "PASS: shared module"
+RUN test -f /usr/share/applications/qvm-remote-gui.desktop && echo "PASS: desktop entry"
+
+# Verify shebangs
+RUN head -1 /usr/bin/qvm-remote-gui | grep -q python3 && echo "PASS: shebang"
+
+# Verify import and version sync
+RUN python3 -c "import sys; sys.path.insert(0, '/usr/lib/qvm-remote'); import qubes_remote_ui; v = open('version').read().strip(); assert qubes_remote_ui.UI_VERSION == v, f'{qubes_remote_ui.UI_VERSION} != {v}'; print(f'PASS: module import and version={v}')"
+
+# Verify run_quick works
+RUN python3 -c "import sys; sys.path.insert(0, '/usr/lib/qvm-remote'); from qubes_remote_ui import run_quick; rc, out, err = run_quick(['echo', 'hello']); assert rc == 0; assert 'hello' in out; print('PASS: run_quick works')"
+
+# Run full test suite
+RUN python3 test/test_gui.py -v
+
+RUN echo "=== Arch Linux GUI tests passed ==="

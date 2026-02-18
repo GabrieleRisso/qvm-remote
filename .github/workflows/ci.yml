@@ -41,3 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make arch-test
+
+  gui-build:
+    name: GUI build + import test (Fedora 41)
+    runs-on: ubuntu-latest
+    needs: syntax-and-unit
+    steps:
+      - uses: actions/checkout@v4
+      - run: make gui-test
+
+  gui-integration:
+    name: GUI Xvfb integration test (Fedora 41)
+    runs-on: ubuntu-latest
+    needs: syntax-and-unit
+    steps:
+      - uses: actions/checkout@v4
+      - run: make gui-integration-test
