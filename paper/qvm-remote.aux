@@ -2,76 +2,152 @@
 \providecommand\hyper@newdestlabel[2]{}
 \providecommand\HyField@AuxAddToFields[1]{}
 \providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{provos2003preventing}
+\citation{rutkowska2010qubes}
+\citation{watson2010capsicum}
+\citation{rutkowska2010qubes}
+\citation{barham2003xen}
+\citation{xi2023rise}
+\citation{openai2024agents}
+\citation{czerwinski2004diary}
+\citation{qubes2024qrexec}
+\citation{rutkowska2010qubes}
 \citation{rutkowska2010qubes}
 \@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
 \newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {1.1}Contributions}{1}{subsection.1.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {2}Background and Motivation}{2}{section.2}\protected@file@percent }
-\newlabel{sec:background}{{2}{2}{Background and Motivation}{section.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}The dom0 Isolation Principle}{2}{subsection.2.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Existing Approaches}{2}{subsection.2.2}\protected@file@percent }
+\citation{provos2003preventing}
+\citation{saltzer1975protection}
+\citation{provos2003preventing}
+\citation{watson2010capsicum}
+\citation{rutkowska2010qubes}
+\citation{qubes2024qrexec}
+\citation{qubes2024vchan}
+\citation{krawczyk1997hmac}
+\citation{bellare2006new}
+\citation{bellare1996keying}
+\citation{bellare2006new}
+\citation{rutkowska2010qubes}
+\citation{nist800-90a}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background}{2}{section.2}\protected@file@percent }
+\newlabel{sec:background}{{2}{2}{Background}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Privilege Separation in OS Design}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}The Xen Qrexec Framework}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}HMAC-Based Authentication}{2}{subsection.2.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {3}Protocol Design}{2}{section.3}\protected@file@percent }
 \newlabel{sec:protocol}{{3}{2}{Protocol Design}{section.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.1}The Pull-Model Invariant}{2}{subsection.3.1}\protected@file@percent }
+\newlabel{def:pull}{{1}{2}{Pull-Model RPC}{definition.1}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Queue Structure}{2}{subsection.3.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Command Lifecycle}{2}{subsection.3.3}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces qvm-remote protocol architecture. \textbf  {(1)}~VM writes command + HMAC to \texttt  {pending/}. \textbf  {(2)}~dom0 polls via \texttt  {qvm-run --pass-io}. \textbf  {(3)}~Verifies HMAC against stored key. \textbf  {(4)}~Executes in sandboxed work directory. \textbf  {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model).}}{3}{figure.caption.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Command Identifier Design}{2}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Protocol Execution}{2}{subsection.3.4}\protected@file@percent }
+\citation{nist800-90a}
+\citation{python2024hmac}
+\citation{brumley2011remote}
+\citation{bellare2006new}
+\citation{bernstein2012security}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {Protocol architecture.} \textbf  {(1)}~VM writes command + HMAC to \texttt  {pending/}. \textbf  {(2)}~dom0 polls via \texttt  {qvm-run --pass-io}. \textbf  {(3)}~Verifies HMAC against stored key. \textbf  {(4)}~Executes in sandboxed work directory. \textbf  {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model); the VM never contacts dom0.}}{3}{figure.caption.1}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
-\newlabel{fig:protocol}{{1}{3}{qvm-remote protocol architecture. \textbf {(1)}~VM writes command + HMAC to \texttt {pending/}. \textbf {(2)}~dom0 polls via \texttt {qvm-run --pass-io}. \textbf {(3)}~Verifies HMAC against stored key. \textbf {(4)}~Executes in sandboxed work directory. \textbf {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model)}{figure.caption.1}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Command ID structure. Combines wall-clock time, process ID, and cryptographic randomness for uniqueness and non-replayability.}}{3}{figure.caption.2}\protected@file@percent }
-\newlabel{fig:cmdid}{{2}{3}{Command ID structure. Combines wall-clock time, process ID, and cryptographic randomness for uniqueness and non-replayability}{figure.caption.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}The ``No Auto-Start'' Property}{3}{subsection.3.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {4}Authentication Scheme}{3}{section.4}\protected@file@percent }
-\newlabel{sec:auth}{{4}{3}{Authentication Scheme}{section.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Key Management}{3}{subsection.4.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Per-Command Tokens}{3}{subsection.4.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Security Properties}{4}{subsection.4.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Authentication properties and their guarantees.}}{4}{table.caption.3}\protected@file@percent }
-\newlabel{tab:auth}{{1}{4}{Authentication properties and their guarantees}{table.caption.3}{}}
+\newlabel{fig:protocol}{{1}{3}{\textbf {Protocol architecture.} \textbf {(1)}~VM writes command + HMAC to \texttt {pending/}. \textbf {(2)}~dom0 polls via \texttt {qvm-run --pass-io}. \textbf {(3)}~Verifies HMAC against stored key. \textbf {(4)}~Executes in sandboxed work directory. \textbf {(5)}~Writes results back to VM. All I/O is initiated by dom0 (pull model); the VM never contacts dom0}{figure.caption.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Command identifier structure. The cryptographic random suffix ensures uniqueness even under concurrent execution.}}{3}{figure.caption.2}\protected@file@percent }
+\newlabel{fig:cmdid}{{2}{3}{Command identifier structure. The cryptographic random suffix ensures uniqueness even under concurrent execution}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Authentication Analysis}{3}{section.4}\protected@file@percent }
+\newlabel{sec:auth}{{4}{3}{Authentication Analysis}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Key Model}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Per-Command Authentication}{3}{subsection.4.2}\protected@file@percent }
+\newlabel{eq:hmac}{{1}{3}{Per-Command Authentication}{equation.1}{}}
+\newlabel{eq:verify}{{2}{3}{Per-Command Authentication}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Security Properties}{3}{subsection.4.3}\protected@file@percent }
+\newlabel{lem:forgery}{{1}{3}{Forgery Resistance}{lemma.1}{}}
+\newlabel{lem:replay}{{2}{3}{Replay Prevention}{lemma.2}{}}
+\newlabel{thm:crossvm}{{1}{3}{Cross-VM Isolation}{theorem.1}{}}
+\citation{nist800-53}
+\citation{bishop2003computer}
+\citation{crosby2003denial}
+\citation{halfond2006classification}
+\citation{bishop2003computer}
+\citation{poettering2010systemd}
+\citation{oliner2012advances}
+\citation{saltzer1975protection}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Brute-Force Analysis}{4}{subsection.4.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {5}Security Analysis}{4}{section.5}\protected@file@percent }
-\newlabel{sec:security}{{5}{4}{Security Analysis}{section.5}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Defense-in-depth: five security layers. Layer~5 (transient by default) means the service stops on reboot unless explicitly enabled.}}{4}{figure.caption.4}\protected@file@percent }
-\newlabel{fig:security}{{3}{4}{Defense-in-depth: five security layers. Layer~5 (transient by default) means the service stops on reboot unless explicitly enabled}{figure.caption.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Layer 1: HMAC-SHA256 Authentication}{4}{subsection.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Layer 2: Input Validation}{4}{subsection.5.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Layer 3: Execution Sandboxing}{4}{subsection.5.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Layer 4: Audit Trail}{4}{subsection.5.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Layer 5: Transient by Default}{5}{subsection.5.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Threat Model}{5}{subsection.5.6}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Threat model: attacks and mitigations.}}{5}{table.caption.5}\protected@file@percent }
-\newlabel{tab:threats}{{2}{5}{Threat model: attacks and mitigations}{table.caption.5}{}}
+\newlabel{eq:bruteforce}{{3}{4}{Brute-Force Analysis}{equation.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Defense-in-Depth Security Model}{4}{section.5}\protected@file@percent }
+\newlabel{sec:security}{{5}{4}{Defense-in-Depth Security Model}{section.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {Five-layer defense-in-depth model.} Each layer provides containment independent of the others.}}{4}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:security}{{3}{4}{\textbf {Five-layer defense-in-depth model.} Each layer provides containment independent of the others}{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}L1: Cryptographic Authentication}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}L2: Input Validation}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}L3: Execution Sandboxing}{4}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}L4: Dual-Sided Audit Trail}{4}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}L5: Transient-by-Default Operation}{4}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Threat Model}{4}{subsection.5.6}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Attack surface and containment mapping.}}{4}{table.caption.4}\protected@file@percent }
+\newlabel{tab:threats}{{1}{4}{Attack surface and containment mapping}{table.caption.4}{}}
+\citation{qubes2024builder}
+\citation{provos2003preventing}
+\citation{watson2010capsicum}
+\citation{rutkowska2010qubes}
+\citation{qubes2023splitgpg}
+\citation{qubes2024u2f}
+\citation{neuman2005kerberos}
+\citation{feldman2021spiffe}
 \@writefile{toc}{\contentsline {section}{\numberline {6}Implementation}{5}{section.6}\protected@file@percent }
 \newlabel{sec:impl}{{6}{5}{Implementation}{section.6}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Design Constraints}{5}{subsection.6.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Component Sizes}{5}{subsection.6.2}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Implementation: single-file components.}}{5}{table.caption.6}\protected@file@percent }
-\newlabel{tab:components}{{3}{5}{Implementation: single-file components}{table.caption.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Packaging and Distribution}{5}{subsection.6.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}CI Pipeline}{5}{subsection.6.4}\protected@file@percent }
-\citation{rutkowska2010qubes}
-\citation{qubes2023splitgpg}
-\citation{tasket2021qubetunnel}
-\citation{ansible2024qubes}
-\citation{risso2026qubesclaw}
-\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{6}{section.7}\protected@file@percent }
-\newlabel{sec:eval}{{7}{6}{Evaluation}{section.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Latency}{6}{subsection.7.1}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Command latency (median of 50 runs on Qubes 4.3).}}{6}{table.caption.7}\protected@file@percent }
-\newlabel{tab:latency}{{4}{6}{Command latency (median of 50 runs on Qubes 4.3)}{table.caption.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Polling Efficiency}{6}{subsection.7.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Comparison with Alternatives}{6}{subsection.7.3}\protected@file@percent }
-\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Comparison with alternative dom0 access methods.}}{6}{table.caption.8}\protected@file@percent }
-\newlabel{tab:comparison}{{5}{6}{Comparison with alternative dom0 access methods}{table.caption.8}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Migration and Compatibility}{6}{section.8}\protected@file@percent }
-\newlabel{sec:migration}{{8}{6}{Migration and Compatibility}{section.8}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{6}{section.9}\protected@file@percent }
-\newlabel{sec:related}{{9}{6}{Related Work}{section.9}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusion}{6}{section.10}\protected@file@percent }
-\newlabel{sec:conclusion}{{10}{6}{Conclusion}{section.10}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Component sizes (pure Python, stdlib only).}}{5}{table.caption.5}\protected@file@percent }
+\newlabel{tab:components}{{2}{5}{Component sizes (pure Python, stdlib only)}{table.caption.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Packaging and Distribution}{5}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Evaluation}{5}{section.7}\protected@file@percent }
+\newlabel{sec:eval}{{7}{5}{Evaluation}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}End-to-End Latency}{5}{subsection.7.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces End-to-end command latency (median of 50 runs).}}{5}{table.caption.6}\protected@file@percent }
+\newlabel{tab:latency}{{3}{5}{End-to-end command latency (median of 50 runs)}{table.caption.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Polling Efficiency}{5}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Comparison with Alternatives}{5}{subsection.7.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Comparison with alternative dom0 access mechanisms.}}{5}{table.caption.7}\protected@file@percent }
+\newlabel{tab:comparison}{{4}{5}{Comparison with alternative dom0 access mechanisms}{table.caption.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Applications}{5}{section.8}\protected@file@percent }
+\newlabel{sec:applications}{{8}{5}{Applications}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Related Work}{5}{section.9}\protected@file@percent }
+\newlabel{sec:related}{{9}{5}{Related Work}{section.9}{}}
+\citation{russinovich2012windows}
+\citation{stevens2003unix}
+\citation{lamport2002specifying}
+\citation{meier2013tamarin}
 \bibcite{rutkowska2010qubes}{1}
-\bibcite{qubes2023splitgpg}{2}
-\bibcite{tasket2021qubetunnel}{3}
-\bibcite{ansible2024qubes}{4}
-\bibcite{risso2026qubesclaw}{5}
+\bibcite{barham2003xen}{2}
+\bibcite{provos2003preventing}{3}
+\bibcite{watson2010capsicum}{4}
+\bibcite{saltzer1975protection}{5}
+\bibcite{krawczyk1997hmac}{6}
+\bibcite{bellare2006new}{7}
+\bibcite{bellare1996keying}{8}
+\bibcite{xi2023rise}{9}
+\bibcite{openai2024agents}{10}
+\bibcite{qubes2024qrexec}{11}
+\bibcite{qubes2024vchan}{12}
+\bibcite{nist800-53}{13}
+\bibcite{bishop2003computer}{14}
+\bibcite{nist800-90a}{15}
+\bibcite{python2024hmac}{16}
+\bibcite{brumley2011remote}{17}
+\bibcite{bernstein2012security}{18}
+\bibcite{crosby2003denial}{19}
+\bibcite{halfond2006classification}{20}
+\bibcite{poettering2010systemd}{21}
+\bibcite{oliner2012advances}{22}
+\bibcite{qubes2023splitgpg}{23}
+\bibcite{qubes2024u2f}{24}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Discussion}{6}{section.10}\protected@file@percent }
+\newlabel{sec:discussion}{{10}{6}{Discussion}{section.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusion}{6}{section.11}\protected@file@percent }
+\newlabel{sec:conclusion}{{11}{6}{Conclusion}{section.11}{}}
+\bibcite{qubes2024builder}{25}
+\bibcite{neuman2005kerberos}{26}
+\bibcite{feldman2021spiffe}{27}
+\bibcite{russinovich2012windows}{28}
+\bibcite{stevens2003unix}{29}
+\bibcite{czerwinski2004diary}{30}
+\bibcite{lamport2002specifying}{31}
+\bibcite{meier2013tamarin}{32}
 \gdef \@abspage@last{7}
