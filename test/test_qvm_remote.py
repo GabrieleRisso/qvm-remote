@@ -375,18 +375,131 @@ class TestSecurity(unittest.TestCase):
         self.assertIn("subprocess.TimeoutExpired", src,
                        "Daemon must handle subprocess.TimeoutExpired")
 
-    def test_daemon_sets_work_file_permissions_after_write(self):
+    def test_daemon_pipes_command_to_bash_stdin(self):
+        """Daemon must pipe commands to bash via stdin, not write temp .sh files."""
         src = DOM0_DAEMON.read_text()
-        self.assertIn("work_file.chmod(0o700)", src,
-                       "Daemon must chmod work file to 0700 after write")
+        self.assertIn('input=script_bytes', src,
+                       "Daemon must pipe command via stdin to bash")
+        self.assertNotIn('work_file', src,
+                         "Daemon must not use temporary .sh work files")
 
-    def test_daemon_validates_before_writing_to_disk(self):
-        """Validation (size, binary) must come before work_file.write_bytes."""
+    def test_daemon_validates_before_execution(self):
+        """Validation (size, binary) must come before subprocess.run(bash)."""
         src = DOM0_DAEMON.read_text()
         validate_pos = src.find("has_binary_content")
-        write_pos = src.find("work_file.write_bytes")
-        self.assertGreater(write_pos, validate_pos,
-                           "Validation must happen before writing to disk")
+        exec_pos = src.find('["bash"], input=script_bytes')
+        self.assertGreater(exec_pos, validate_pos,
+                           "Validation must happen before command execution")
+
+    def test_daemon_reject_cleans_auth_and_cmd_files(self):
+        """Reject must clean .auth and .cmd alongside the main pending file."""
+        src = DOM0_DAEMON.read_text()
+        reject_fn = src[src.find("def reject("):]
+        self.assertIn(".auth", reject_fn,
+                       "Reject must also delete .auth orphans")
+        self.assertIn(".cmd", reject_fn,
+                       "Reject must also delete .cmd orphans")
+
+    def test_daemon_recovers_stale_running_on_startup(self):
+        """Daemon must have a recover_stale_running function for crash recovery."""
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("recover_stale_running", src,
+                       "Daemon must recover stale running-queue entries on startup")
+        self.assertIn("daemon restarted", src,
+                       "Recovery must signal interrupted state to clients")
+
+    def test_client_cleans_stale_queue_on_startup(self):
+        """Client must clean stale queue entries on every invocation."""
+        src = VM_CLIENT.read_text()
+        self.assertIn("cleanup_stale_queue", src,
+                       "Client must have stale queue cleanup")
+        self.assertIn("STALE_AGE", src,
+                       "Client must define a max age for stale entries")
+
+    def test_client_timeout_cleans_all_files(self):
+        """Client timeout cleanup must remove .cmd and .auth alongside pending/running."""
+        src = VM_CLIENT.read_text()
+        timeout_section = src[src.find("TIMEOUT id="):]
+        self.assertIn(".cmd", timeout_section,
+                       "Timeout cleanup must remove .cmd files")
+        self.assertIn(".auth", timeout_section,
+                       "Timeout cleanup must remove .auth files")
+
+    def test_webui_does_not_create_var_run_qvm_remote(self):
+        """Web UI must not create /var/run/qvm-remote (no longer needed)."""
+        webui = REPO_ROOT / "webui" / "qubes-global-admin-web"
+        src = webui.read_text()
+        self.assertNotIn("/var/run/qvm-remote", src,
+                         "Web UI must not reference /var/run/qvm-remote")
+
+    def test_daemon_has_connect_disconnect_commands(self):
+        """Daemon must support connect/disconnect for full VM lifecycle."""
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("cmd_connect", src,
+                       "Daemon must have connect command")
+        self.assertIn("cmd_disconnect", src,
+                       "Daemon must have disconnect command")
+        self.assertIn("_write_conf_vms", src,
+                       "Connect must update config file")
+
+    def test_daemon_has_queue_management(self):
+        """Daemon must have queue status/clean/recover/debug subcommands."""
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("cmd_queue_op", src,
+                       "Daemon must have queue management command")
+        for action in ("status", "clean", "recover", "debug"):
+            self.assertIn(f'action == "{action}"', src,
+                           f"Daemon queue must handle '{action}' action")
+
+    def test_daemon_has_status_report(self):
+        """Daemon must have a full status report command."""
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("cmd_status_report", src,
+                       "Daemon must have status report command")
+
+    def test_daemon_auth_reject_returns_error_to_client(self):
+        """Auth failures must write error results so the client doesn't wait forever."""
+        src = DOM0_DAEMON.read_text()
+        self.assertIn("auth_reject", src,
+                       "Daemon must have auth_reject helper")
+        self.assertIn("write_error", src,
+                       "auth_reject must support writing error results")
+        self.assertIn("exit_code=126", src,
+                       "Auth errors must use exit code 126 (permission denied)")
+
+    def test_client_has_queue_commands(self):
+        """Client must support queue status/clean/debug subcommands."""
+        src = VM_CLIENT.read_text()
+        self.assertIn("cmd_queue_status", src,
+                       "Client must have queue status command")
+        self.assertIn("cmd_queue_clean", src,
+                       "Client must have queue clean command")
+        self.assertIn("cmd_queue_debug", src,
+                       "Client must have queue debug command")
+
+    def test_client_has_status_command(self):
+        """Client must have a full status command showing key, queue, daemon."""
+        src = VM_CLIENT.read_text()
+        self.assertIn("cmd_status", src,
+                       "Client must have status command")
+
+    def test_webui_has_queue_action_api(self):
+        """Web UI must have API endpoints for queue management."""
+        webui = REPO_ROOT / "webui" / "qubes-global-admin-web"
+        src = webui.read_text()
+        self.assertIn("/api/queue", src,
+                       "Web UI must have /api/queue route")
+        self.assertIn("api_queue_action", src,
+                       "Web UI must have queue action handler")
+
+    def test_webui_has_connect_disconnect_api(self):
+        """Web UI must have API endpoints for connect/disconnect."""
+        webui = REPO_ROOT / "webui" / "qubes-global-admin-web"
+        src = webui.read_text()
+        self.assertIn("/api/connect", src,
+                       "Web UI must have /api/connect route")
+        self.assertIn("/api/disconnect", src,
+                       "Web UI must have /api/disconnect route")
 
     def test_daemon_systemctl_calls_have_timeout(self):
         src = DOM0_DAEMON.read_text()

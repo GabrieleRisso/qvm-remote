@@ -11,10 +11,6 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Hardened work directory
-RuntimeDirectory=qvm-remote
-RuntimeDirectoryMode=0700
-
 [Install]
 # Not enabled by default.  Use: qvm-remote-dom0 enable
 WantedBy=multi-user.target

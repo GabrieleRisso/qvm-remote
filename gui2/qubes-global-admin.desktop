@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Qubes Global Admin
+Comment=Manage qvm-remote: execute dom0 commands, transfer files, backups
+Exec=/usr/bin/qubes-global-admin
+Icon=qubes-manager
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=qubes;remote;admin;dom0;
+StartupNotify=true

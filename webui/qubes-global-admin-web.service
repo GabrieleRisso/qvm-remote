@@ -1,0 +1,15 @@
+[Unit]
+Description=Qubes Global Admin Web (localhost)
+After=network.target
+Documentation=man:qvm-remote(1)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qubes-global-admin-web
+Restart=on-failure
+RestartSec=5
+User=root
+Environment=QUBES_ADMIN_PORT=9876
+
+[Install]
+WantedBy=multi-user.target

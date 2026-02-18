@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Qubes Global Admin (Web)
+Comment=Web-based admin panel for Qubes OS -- localhost, air-gapped
+Exec=sh -c 'systemctl start qubes-global-admin-web 2>/dev/null; sleep 1; xdg-open http://127.0.0.1:9876'
+Icon=qubes-manager
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=qubes;remote;admin;web;
+StartupNotify=true

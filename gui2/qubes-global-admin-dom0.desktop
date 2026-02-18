@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Qubes Global Admin (Dom0)
+Comment=Dom0 service dashboard: daemon control, VM keys, backups, logs
+Exec=/usr/bin/qubes-global-admin-dom0
+Icon=qubes-manager
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=qubes;remote;admin;dom0;daemon;
+StartupNotify=true

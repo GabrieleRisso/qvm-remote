@@ -1,0 +1,978 @@
+#!/usr/bin/python3
+# qubes-global-admin -- Unified admin UI launched from dom0
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Qubes Global Admin -- unified dom0 + VM management tool.
+
+Launched from dom0. Opens a single window with left-sidebar tabs:
+  - Dashboard     -- dom0 daemon status, autostart, config
+  - Execute       -- run commands in dom0 (via VM's qvm-remote)
+  - Virtual Machines -- authorized VMs, keys, VM lifecycle
+  - Files         -- transfer files between VMs via dom0
+  - Backup        -- local, git, and system backups
+  - Log           -- daemon log viewer
+  - This Device   -- system info (dom0 + connected VM)
+
+Also starts the VM-side qvm-remote-gui (if the VM has one) so both
+UIs are available simultaneously.
+"""
+
+from __future__ import annotations
+import os, sys, threading, time, signal
+from datetime import datetime
+from pathlib import Path
+
+_self_dir = os.path.dirname(os.path.abspath(__file__))
+for p in [_self_dir, "/usr/lib/qvm-remote"]:
+    if os.path.isfile(os.path.join(p, "qubes_admin_ui.py")):
+        sys.path.insert(0, p)
+        break
+
+from qubes_admin_ui import (
+    UI_VERSION, QUBES_BLUE, COLORS, LABEL_COLORS,
+    apply_css, check_display,
+    label, section, group_title, card, btn, entry, info_box,
+    hbox, vbox, scrolled,
+    StatusDot, OutputView, AsyncRunner,
+    run_cmd, valid_hex_key, fmt_size,
+    confirm, show_info, show_error, notify,
+    ICON_INFO, ICON_OK, ICON_WARN, ICON_ERR, ICON_KEY, ICON_NET,
+    ICON_SEND, ICON_DISK,
+    backup_create, backup_restore, backup_list,
+    git_push, git_pull,
+)
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+CONF_FILE = Path("/etc/qubes/remote.conf")
+KEY_DIR = Path("/etc/qubes/remote.d")
+LOG_FILE = Path("/var/log/qubes/qvm-remote.log")
+VM_DATA = Path.home() / ".qvm-remote"
+
+# Which VM this tool manages (read from config or default)
+def _get_managed_vm():
+    if CONF_FILE.exists():
+        try:
+            for line in CONF_FILE.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("QVM_REMOTE_VMS="):
+                    vms = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return vms.split()[0] if vms else "visyble"
+        except OSError:
+            pass
+    return "visyble"
+
+MANAGED_VM = _get_managed_vm()
+
+
+class QubesGlobalAdmin(Gtk.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app,
+                         title="Qubes Global Admin")
+        self.set_default_size(1200, 800)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        acc = Gtk.AccelGroup()
+        acc.connect(Gdk.keyval_from_name("q"),
+                    Gdk.ModifierType.CONTROL_MASK, 0, lambda *_: self.close())
+        acc.connect(Gdk.keyval_from_name("Return"),
+                    Gdk.ModifierType.CONTROL_MASK, 0,
+                    lambda *_: self._on_execute(None))
+        self.add_accel_group(acc)
+
+        self._vm_gui_proc = None
+        root = vbox()
+        self.add(root)
+
+        # ── Title bar ──
+        tb = hbox(12)
+        tb.get_style_context().add_class("title_bar")
+        tb.pack_start(label("Qubes Global Admin", "title_text"), False, False, 0)
+        tb.pack_end(label("v" + UI_VERSION, "version_label"), False, False, 0)
+        root.pack_start(tb, False, False, 0)
+
+        # ── Connection bar ──
+        self._conn_bar = hbox(8)
+        self._conn_bar.get_style_context().add_class("conn_bar")
+        self._conn_bar.get_style_context().add_class("conn_bar_warn")
+        self._conn_dot = StatusDot("Checking connection to " + MANAGED_VM + "...", "warn",
+            tip="Shows whether the dom0 daemon is running and the managed VM is reachable")
+        self._conn_bar.pack_start(self._conn_dot, False, False, 0)
+        self._conn_vm_label = label("VM: " + MANAGED_VM, "small_title",
+            tip="The VM configured in /etc/qubes/remote.conf")
+        self._conn_bar.pack_end(self._conn_vm_label, False, False, 0)
+        root.pack_start(self._conn_bar, False, False, 0)
+
+        # ── Notebook ──
+        self._nb = Gtk.Notebook()
+        self._nb.set_name("main_notebook")
+        self._nb.set_tab_pos(Gtk.PositionType.LEFT)
+        self._nb.set_show_border(True)
+        root.pack_start(self._nb, True, True, 0)
+
+        self._build_dashboard()
+        self._build_execute()
+        self._build_vms()
+        self._build_files()
+        self._build_backup()
+        self._build_log()
+        self._build_device()
+
+        self._nb.connect("switch-page", self._on_tab_switch)
+
+        GLib.timeout_add_seconds(8, self._poll_connection)
+        GLib.idle_add(self._initial_check)
+
+        self.connect("destroy", self._on_destroy)
+
+    # ── Connection monitoring ─────────────────────────────────────
+
+    def _initial_check(self):
+        threading.Thread(target=self._check_conn, daemon=True).start()
+        return False
+
+    def _poll_connection(self):
+        threading.Thread(target=self._check_conn, daemon=True).start()
+        return True
+
+    def _check_conn(self):
+        rc1, _, _ = run_cmd(["systemctl", "is-active", "qvm-remote-dom0"], timeout=5)
+        svc_ok = rc1 == 0
+        if not svc_ok:
+            rc1b, _, _ = run_cmd(["pgrep", "-f", "qvm-remote-dom0"], timeout=3)
+            svc_ok = rc1b == 0
+
+        rc2, _, _ = run_cmd(["qvm-check", MANAGED_VM, "--running"], timeout=5)
+        vm_ok = rc2 == 0
+
+        if svc_ok and vm_ok:
+            GLib.idle_add(self._set_conn, "ok",
+                "Connected to {} -- daemon running, VM online".format(MANAGED_VM))
+        elif svc_ok:
+            GLib.idle_add(self._set_conn, "warn",
+                "Daemon running but {} is not running".format(MANAGED_VM))
+        else:
+            GLib.idle_add(self._set_conn, "error",
+                "Daemon stopped -- start it from the Dashboard tab")
+
+    def _set_conn(self, state, text):
+        self._conn_dot.set_state(state, text)
+        ctx = self._conn_bar.get_style_context()
+        for c in ("conn_bar_ok", "conn_bar_warn", "conn_bar_err"):
+            ctx.remove_class(c)
+        ctx.add_class({"ok": "conn_bar_ok", "warn": "conn_bar_warn",
+                        "error": "conn_bar_err"}.get(state, "conn_bar_warn"))
+
+    # ── Start VM GUI alongside ────────────────────────────────────
+
+    def _start_vm_gui(self):
+        try:
+            rc, _, _ = run_cmd(["qvm-check", MANAGED_VM, "--running"], timeout=5)
+            if rc != 0:
+                run_cmd(["qvm-start", MANAGED_VM], timeout=60)
+            self._vm_gui_proc = subprocess.Popen(
+                ["qvm-run", "--no-gui", "--pass-io", MANAGED_VM,
+                 "qubes-global-admin 2>/dev/null || qvm-remote-gui 2>/dev/null || true"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _on_destroy(self, _w):
+        if self._vm_gui_proc:
+            self._vm_gui_proc.terminate()
+
+    # ── (1) Dashboard ─────────────────────────────────────────────
+
+    def _build_dashboard(self):
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("Service Dashboard",
+            tip="Monitor and control the qvm-remote dom0 daemon"), False, False, 0)
+        page.pack_start(label(
+            "The qvm-remote daemon runs in dom0 and executes authenticated "
+            "commands from authorized VMs. Start, stop, or configure it here.",
+            "explanation"), False, False, 0)
+
+        sc = card("Service Status",
+            tip="Current state of the qvm-remote-dom0 systemd service")
+        self._svc_dot = StatusDot("Checking...", "warn",
+            tip="Green = running, Red = stopped, Yellow = checking")
+        sc.pack_start(self._svc_dot, False, False, 0)
+        self._svc_ver = label("", "explanation",
+            tip="Version of the installed qvm-remote-dom0 binary")
+        sc.pack_start(self._svc_ver, False, False, 4)
+
+        cr = hbox()
+        start_b = btn("Start", "button_save", "media-playback-start-symbolic",
+            tip="Start the qvm-remote-dom0 daemon via systemctl")
+        start_b.connect("clicked", self._on_svc_start)
+        cr.pack_start(start_b, False, False, 0)
+        stop_b = btn("Stop", "button_danger", "media-playback-stop-symbolic",
+            tip="Stop the daemon -- VMs will not be able to run commands")
+        stop_b.connect("clicked", self._on_svc_stop)
+        cr.pack_start(stop_b, False, False, 0)
+        restart_b = btn("Restart", "flat_button", "view-refresh-symbolic",
+            tip="Restart the daemon (stop + start)")
+        restart_b.connect("clicked", self._on_svc_restart)
+        cr.pack_start(restart_b, False, False, 0)
+        sc.pack_start(cr, False, False, 0)
+        page.pack_start(sc, False, False, 8)
+
+        ac = card("Autostart",
+            tip="Control whether the daemon starts automatically on dom0 boot")
+        ac.pack_start(label(
+            "When enabled, the daemon starts automatically on every boot via systemd. "
+            "This means authorized VMs can submit commands at all times.",
+            "explanation"), False, False, 0)
+        ar = hbox()
+        self._auto_dot = StatusDot("Unknown", "unknown",
+            tip="Whether the systemd unit is enabled for boot")
+        ar.pack_start(self._auto_dot, False, False, 0)
+        en_b = btn("Enable", "flat_button", tip="Enable auto-start on boot")
+        en_b.connect("clicked", self._on_auto_enable)
+        ar.pack_start(en_b, False, False, 0)
+        dis_b = btn("Disable", "flat_button", tip="Disable auto-start")
+        dis_b.connect("clicked", self._on_auto_disable)
+        ar.pack_start(dis_b, False, False, 0)
+        ac.pack_start(ar, False, False, 0)
+        page.pack_start(ac, False, False, 8)
+
+        cc = card("Configuration",
+            tip="Contents of /etc/qubes/remote.conf -- lists authorized VMs")
+        self._cfg_view = OutputView(100)
+        self._cfg_view.set_tooltip_text("The daemon reads this file to know which VMs to poll")
+        cc.pack_start(self._cfg_view, True, True, 0)
+        page.pack_start(cc, True, True, 8)
+
+        self._nb.append_page(page, Gtk.Label(label="Dashboard"))
+
+    def _refresh_dashboard(self):
+        rc, out, _ = run_cmd(["systemctl", "is-active", "qvm-remote-dom0"], timeout=5)
+        if out.strip() == "active":
+            self._svc_dot.set_state("ok", "Running (systemd)")
+        else:
+            rc2, _, _ = run_cmd(["pgrep", "-f", "qvm-remote-dom0"], timeout=3)
+            if rc2 == 0:
+                self._svc_dot.set_state("ok", "Running (manual)")
+            else:
+                self._svc_dot.set_state("error", "Stopped")
+        rc, out, _ = run_cmd(["qvm-remote-dom0", "--version"], timeout=5)
+        self._svc_ver.set_text("Version: " + out.strip() if rc == 0 else "")
+        rc, out, _ = run_cmd(["systemctl", "is-enabled", "qvm-remote-dom0"], timeout=5)
+        en = out.strip() == "enabled"
+        self._auto_dot.set_state("ok" if en else "warn", "Enabled" if en else "Disabled")
+        if CONF_FILE.exists():
+            try:
+                self._cfg_view.set_text(CONF_FILE.read_text())
+            except OSError:
+                self._cfg_view.set_text("Could not read config")
+        else:
+            self._cfg_view.set_text("Config not found: " + str(CONF_FILE))
+
+    def _svc_ctl(self, action, msg=None):
+        if msg and not confirm(self, action.title() + " service?", msg):
+            return
+        rc, _, err = run_cmd(["systemctl", action, "qvm-remote-dom0"], timeout=15)
+        if rc != 0:
+            show_error(self, "Failed", err.strip())
+        self._refresh_dashboard()
+
+    def _on_svc_start(self, _): self._svc_ctl("start")
+    def _on_svc_stop(self, _): self._svc_ctl("stop",
+        "This stops the remote command executor.\nVMs will not be able to run commands until restarted.")
+    def _on_svc_restart(self, _): self._svc_ctl("restart")
+
+    def _on_auto_enable(self, _):
+        if not confirm(self, "Enable autostart?",
+                "The daemon will start on every boot.\n"
+                "Authorized VMs can submit commands at all times.\n"
+                "Only enable if you understand the security implications."):
+            return
+        self._svc_ctl("enable")
+
+    def _on_auto_disable(self, _):
+        self._svc_ctl("disable")
+
+    # ── (2) Execute ───────────────────────────────────────────────
+
+    def _build_execute(self):
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("Execute Command in Dom0",
+            tip="Run shell commands in dom0 via the authenticated qvm-remote channel"), False, False, 0)
+        page.pack_start(label(
+            "Commands are sent from {} to dom0, authenticated with HMAC-SHA256, "
+            "and executed by the daemon. Output streams back in real time.".format(MANAGED_VM),
+            "explanation"), False, False, 0)
+
+        cc = card("Command",
+            tip="Type a shell command to execute in dom0")
+        self._cmd_entry = Gtk.Entry()
+        self._cmd_entry.set_placeholder_text("e.g. qvm-ls --running --fields NAME,CLASS,LABEL,MEM")
+        self._cmd_entry.set_tooltip_text(
+            "Shell command to run in dom0. Press Ctrl+Enter or click Execute.\n"
+            "Examples: qvm-ls, xl info, systemctl status qubesd")
+        self._cmd_entry.connect("activate", self._on_execute)
+        cc.pack_start(self._cmd_entry, False, False, 0)
+
+        br = hbox()
+        ex_b = btn("Execute", "button_save", "system-run-symbolic",
+            tip="Execute the command in dom0 (Ctrl+Enter)")
+        ex_b.connect("clicked", self._on_execute)
+        br.pack_start(ex_b, False, False, 0)
+        tr = hbox(4)
+        tr.pack_start(label("Timeout:", tip="Maximum seconds before the command is killed"), False, False, 0)
+        self._timeout = Gtk.SpinButton.new_with_range(5, 3600, 5)
+        self._timeout.set_value(300)
+        self._timeout.set_tooltip_text(
+            "Maximum execution time in seconds.\n"
+            "Long-running commands (backups, updates) need higher values.\n"
+            "Default 300s. The daemon enforces this limit to prevent hangs.")
+        tr.pack_start(self._timeout, False, False, 0)
+        tr.pack_start(label("sec"), False, False, 0)
+        br.pack_end(tr, False, False, 0)
+        cc.pack_start(br, False, False, 0)
+        page.pack_start(cc, False, False, 8)
+
+        page.pack_start(section("Output",
+            tip="Real-time output from the command running in dom0"), False, False, 0)
+        self._exec_ov = OutputView(300)
+        self._exec_ov.set_tooltip_text("Command stdout and stderr appear here in real time")
+        self._exec_run = AsyncRunner(self._exec_ov, self._on_exec_done)
+        page.pack_start(self._exec_ov, True, True, 0)
+        self._exec_dot = StatusDot("Ready", "ok",
+            tip="Green = success (exit 0), Red = failure, Yellow = running")
+        page.pack_start(self._exec_dot, False, False, 8)
+
+        self._nb.append_page(page, Gtk.Label(label="Execute"))
+
+    def _on_execute(self, _):
+        cmd = self._cmd_entry.get_text().strip()
+        if not cmd:
+            return
+        t = int(self._timeout.get_value())
+        self._exec_dot.set_state("warn", "Running...")
+        self._exec_run.run(["qvm-remote", "-t", str(t), cmd])
+
+    def _on_exec_done(self, rc):
+        if rc == 0:
+            self._exec_dot.set_state("ok", "Completed (exit 0)")
+        elif rc == 124:
+            self._exec_dot.set_state("error", "Timed out")
+        else:
+            self._exec_dot.set_state("error", "Failed (exit {})".format(rc))
+
+    # ── (3) Virtual Machines ──────────────────────────────────────
+
+    def _build_vms(self):
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("Virtual Machines",
+            tip="Manage which VMs can send commands to dom0"), False, False, 0)
+        page.pack_start(label(
+            "Each VM needs a registered HMAC-SHA256 key to authenticate commands. "
+            "Only authorized VMs listed here can execute anything in dom0.",
+            "explanation"), False, False, 0)
+
+        page.pack_start(section("Authorized VMs",
+            "VMs with registered keys that can send commands to dom0.",
+            tip="Each entry is a VM name with its key file in /etc/qubes/remote.d/"), False, False, 0)
+        self._vm_list = Gtk.ListBox()
+        self._vm_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._vm_list.set_tooltip_text("Select a VM and click Revoke to remove its authorization")
+        vs = Gtk.ScrolledWindow()
+        vs.set_min_content_height(120)
+        vs.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vs.add(self._vm_list)
+        page.pack_start(vs, False, False, 8)
+
+        vb = hbox()
+        ref_b = btn("Refresh", "flat_button", "view-refresh-symbolic",
+            tip="Reload the list of authorized VMs from /etc/qubes/remote.d/")
+        ref_b.connect("clicked", lambda _: self._refresh_vm_list())
+        vb.pack_start(ref_b, False, False, 0)
+        rev_b = btn("Revoke Selected", "button_danger",
+            tip="Remove the selected VM's key -- it will no longer be able to run commands")
+        rev_b.connect("clicked", self._on_revoke)
+        vb.pack_start(rev_b, False, False, 0)
+        page.pack_start(vb, False, False, 0)
+
+        page.pack_start(section("Authorize New VM",
+            "Register a new VM with its HMAC-SHA256 key.",
+            tip="The VM must first run 'qvm-remote key gen' to create its key"), False, False, 0)
+        ac = card()
+        ar1 = hbox()
+        ar1.pack_start(label("VM name:", tip="The Qubes VM name (e.g. work, personal)"), False, False, 0)
+        self._auth_vm = entry("vm-name", tip="Name of the VM to authorize")
+        ar1.pack_start(self._auth_vm, True, True, 0)
+        ac.pack_start(ar1, False, False, 0)
+        ar2 = hbox()
+        ar2.pack_start(label("Key:", tip="64-character hex key from 'qvm-remote key show' in the VM"), False, False, 0)
+        self._auth_key = entry("64-character hex key",
+            tip="Paste the 64-char hex key generated by 'qvm-remote key gen' in the VM")
+        ar2.pack_start(self._auth_key, True, True, 0)
+        auth_b = btn("Authorize", "button_save", "security-high-symbolic",
+            tip="Register this VM+key pair so it can send commands to dom0")
+        auth_b.connect("clicked", self._on_authorize)
+        ar2.pack_start(auth_b, False, False, 0)
+        ac.pack_start(ar2, False, False, 0)
+        page.pack_start(ac, False, False, 8)
+
+        page.pack_start(section("VM Lifecycle",
+            "Start, stop, or check VMs from here.",
+            tip="Uses qvm-start/qvm-shutdown/qvm-check in dom0"), False, False, 0)
+        lc = card()
+        lr = hbox()
+        lr.pack_start(label("VM:", tip="Target VM name"), False, False, 0)
+        self._lc_vm = entry(MANAGED_VM, tip="Which VM to control")
+        lr.pack_start(self._lc_vm, True, True, 0)
+        start_vm = btn("Start", "button_save", tip="Start the VM (qvm-start)")
+        start_vm.connect("clicked", self._on_vm_start)
+        lr.pack_start(start_vm, False, False, 0)
+        stop_vm = btn("Shutdown", "button_danger", tip="Graceful shutdown (qvm-shutdown --wait)")
+        stop_vm.connect("clicked", self._on_vm_stop)
+        lr.pack_start(stop_vm, False, False, 0)
+        check_vm = btn("Check", "flat_button", tip="Check if VM is running")
+        check_vm.connect("clicked", self._on_vm_check)
+        lr.pack_start(check_vm, False, False, 0)
+        lc.pack_start(lr, False, False, 0)
+        page.pack_start(lc, False, False, 8)
+
+        self._vm_ov = OutputView(80)
+        self._vm_ov.set_tooltip_text("Output from VM management commands")
+        page.pack_start(self._vm_ov, True, True, 0)
+
+        sw.add(page)
+        self._nb.append_page(sw, Gtk.Label(label="Virtual Machines"))
+
+    def _refresh_vm_list(self):
+        for ch in self._vm_list.get_children():
+            self._vm_list.remove(ch)
+        rc, out, _ = run_cmd(["qvm-remote-dom0", "keys"], timeout=10)
+        if rc == 0 and out.strip():
+            for line in out.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                row = Gtk.ListBoxRow()
+                row._vm_name = line.split()[0] if " " in line else line
+                bx = hbox(12)
+                bx.get_style_context().add_class("permission_row")
+                bx.pack_start(label("  " + line), True, True, 0)
+                row.add(bx)
+                self._vm_list.add(row)
+        else:
+            row = Gtk.ListBoxRow()
+            row._vm_name = None
+            bx = hbox()
+            bx.get_style_context().add_class("permission_row")
+            bx.pack_start(label("No authorized VMs", "explanation"), False, False, 0)
+            row.add(bx)
+            self._vm_list.add(row)
+        self._vm_list.show_all()
+
+    def _on_authorize(self, _):
+        vm = self._auth_vm.get_text().strip()
+        key = self._auth_key.get_text().strip()
+        if not vm or not key:
+            show_error(self, "Missing fields", "Enter both VM name and key.")
+            return
+        rc, out, err = run_cmd(["qvm-remote-dom0", "authorize", vm, key], timeout=10)
+        self._vm_ov.set_text(out + err)
+        if rc == 0:
+            self._auth_vm.set_text("")
+            self._auth_key.set_text("")
+            self._refresh_vm_list()
+            notify("VM authorized: " + vm, icon=ICON_KEY)
+
+    def _on_revoke(self, _):
+        row = self._vm_list.get_selected_row()
+        if not row or not row._vm_name:
+            return
+        vm = row._vm_name
+        if not confirm(self, "Revoke " + vm + "?",
+                "Remove authentication key for '{}'.\n"
+                "The VM will no longer be able to execute commands in dom0.".format(vm)):
+            return
+        rc, out, err = run_cmd(["qvm-remote-dom0", "revoke", vm], timeout=10)
+        self._vm_ov.set_text(out + err)
+        if rc == 0:
+            self._refresh_vm_list()
+            notify("VM revoked: " + vm, icon=ICON_KEY)
+
+    def _on_vm_start(self, _):
+        vm = self._lc_vm.get_text().strip()
+        if not vm:
+            return
+        self._vm_ov.clear()
+        self._vm_ov.append("Starting {}...\n".format(vm))
+        AsyncRunner(self._vm_ov).run(["qvm-start", vm])
+
+    def _on_vm_stop(self, _):
+        vm = self._lc_vm.get_text().strip()
+        if not vm:
+            return
+        if not confirm(self, "Shutdown " + vm + "?",
+                "This will gracefully shut down the VM."):
+            return
+        self._vm_ov.clear()
+        AsyncRunner(self._vm_ov).run(["qvm-shutdown", "--wait", "--timeout", "90", vm])
+
+    def _on_vm_check(self, _):
+        vm = self._lc_vm.get_text().strip()
+        if not vm:
+            return
+        rc, out, err = run_cmd(["qvm-check", vm, "--running"], timeout=5)
+        if rc == 0:
+            self._vm_ov.set_text("{} is running".format(vm))
+        else:
+            self._vm_ov.set_text("{} is NOT running".format(vm))
+
+    # ── (4) Files ─────────────────────────────────────────────────
+
+    def _build_files(self):
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("File Transfers",
+            tip="Transfer files between dom0, the managed VM, and other VMs"), False, False, 0)
+        page.pack_start(label(
+            "Use qvm-run --pass-io to pipe files between VMs through dom0. "
+            "All transfers are logged in the daemon audit log.",
+            "explanation"), False, False, 0)
+
+        # Push dom0 -> VM
+        pc = card("Push File: Dom0 to VM",
+            tip="Copy a file from dom0 into a VM using qvm-run --pass-io")
+        pr1 = hbox()
+        pr1.pack_start(label("Target VM:", tip="VM to receive the file"), False, False, 0)
+        self._push_vm = entry(MANAGED_VM, tip="Destination VM name")
+        pr1.pack_start(self._push_vm, True, True, 0)
+        pc.pack_start(pr1, False, False, 0)
+        pr2 = hbox()
+        pr2.pack_start(label("Dom0 path:", tip="Path to the file in dom0"), False, False, 0)
+        self._push_src = entry("/tmp/", tip="Source file path in dom0")
+        pr2.pack_start(self._push_src, True, True, 0)
+        pr2.pack_start(label("VM path:", tip="Destination path inside the VM"), False, False, 0)
+        self._push_dst = entry("/tmp/", tip="Where to write the file in the VM")
+        pr2.pack_start(self._push_dst, True, True, 0)
+        push_b = btn("Push", "button_save", "document-send-symbolic",
+            tip="Send the file from dom0 to the VM")
+        push_b.connect("clicked", self._on_push)
+        pr2.pack_start(push_b, False, False, 0)
+        pc.pack_start(pr2, False, False, 0)
+        page.pack_start(pc, False, False, 8)
+
+        # Pull VM -> dom0
+        fc = card("Pull File: VM to Dom0",
+            tip="Fetch a file from a VM into dom0")
+        fr1 = hbox()
+        fr1.pack_start(label("Source VM:", tip="VM containing the file"), False, False, 0)
+        self._pull_vm = entry(MANAGED_VM, tip="Source VM name")
+        fr1.pack_start(self._pull_vm, True, True, 0)
+        fr1.pack_start(label("VM path:", tip="Path to the file inside the VM"), False, False, 0)
+        self._pull_src = entry("/path/in/vm", tip="File to pull from the VM")
+        fr1.pack_start(self._pull_src, True, True, 0)
+        fc.pack_start(fr1, False, False, 0)
+        fr2 = hbox()
+        fr2.pack_start(label("Dom0 dest:", tip="Where to save the file in dom0"), False, False, 0)
+        self._pull_dst = entry("/tmp/", tip="Destination path in dom0")
+        fr2.pack_start(self._pull_dst, True, True, 0)
+        pull_b = btn("Pull", "button_save", "document-save-symbolic",
+            tip="Fetch the file from the VM to dom0")
+        pull_b.connect("clicked", self._on_pull)
+        fr2.pack_start(pull_b, False, False, 0)
+        fc.pack_start(fr2, False, False, 0)
+        page.pack_start(fc, False, False, 8)
+
+        # VM-to-VM
+        vc = card("Copy Between VMs",
+            tip="Pipe a file from one VM to another through dom0")
+        vr1 = hbox()
+        vr1.pack_start(label("Source VM:", tip="VM to copy from"), False, False, 0)
+        self._xfer_src_vm = entry("source-vm")
+        vr1.pack_start(self._xfer_src_vm, True, True, 0)
+        vr1.pack_start(label("Path:"), False, False, 0)
+        self._xfer_src_path = entry("/path/in/source")
+        vr1.pack_start(self._xfer_src_path, True, True, 0)
+        vc.pack_start(vr1, False, False, 0)
+        vr2 = hbox()
+        vr2.pack_start(label("Dest VM:", tip="VM to copy to"), False, False, 0)
+        self._xfer_dst_vm = entry("dest-vm")
+        vr2.pack_start(self._xfer_dst_vm, True, True, 0)
+        vr2.pack_start(label("Path:"), False, False, 0)
+        self._xfer_dst_path = entry("/path/in/dest")
+        vr2.pack_start(self._xfer_dst_path, True, True, 0)
+        xfer_b = btn("Copy", "button_save",
+            tip="Pipe file from source VM through dom0 to dest VM")
+        xfer_b.connect("clicked", self._on_xfer)
+        vr2.pack_start(xfer_b, False, False, 0)
+        vc.pack_start(vr2, False, False, 0)
+        page.pack_start(vc, False, False, 8)
+
+        self._file_ov = OutputView(120)
+        self._file_ov.set_tooltip_text("Output from file transfer commands")
+        page.pack_start(self._file_ov, True, True, 0)
+        self._nb.append_page(page, Gtk.Label(label="Files"))
+
+    def _on_push(self, _):
+        vm = self._push_vm.get_text().strip()
+        src = self._push_src.get_text().strip()
+        dst = self._push_dst.get_text().strip()
+        if not all([vm, src, dst]):
+            show_error(self, "Missing fields", "Fill in all fields.")
+            return
+        AsyncRunner(self._file_ov).run(
+            ["bash", "-c", "cat '{}' | qvm-run --pass-io --no-gui {} 'cat > \"{}\"'".format(src, vm, dst)])
+
+    def _on_pull(self, _):
+        vm = self._pull_vm.get_text().strip()
+        src = self._pull_src.get_text().strip()
+        dst = self._pull_dst.get_text().strip()
+        if not all([vm, src, dst]):
+            show_error(self, "Missing fields", "Fill in all fields.")
+            return
+        AsyncRunner(self._file_ov).run(
+            ["bash", "-c", "qvm-run --pass-io --no-gui {} 'cat \"{}\"' > '{}'".format(vm, src, dst)])
+
+    def _on_xfer(self, _):
+        sv = self._xfer_src_vm.get_text().strip()
+        sp = self._xfer_src_path.get_text().strip()
+        dv = self._xfer_dst_vm.get_text().strip()
+        dp = self._xfer_dst_path.get_text().strip()
+        if not all([sv, sp, dv, dp]):
+            show_error(self, "Missing fields", "Fill in all fields.")
+            return
+        AsyncRunner(self._file_ov).run(
+            ["bash", "-c",
+             "qvm-run --pass-io --no-gui {} 'cat \"{}\"' | "
+             "qvm-run --pass-io --no-gui {} 'cat > \"{}\"'".format(sv, sp, dv, dp)])
+
+    # ── (5) Backup ────────────────────────────────────────────────
+
+    def _build_backup(self):
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("Backup & Recovery",
+            tip="Create local backups, push to Git, or trigger full Qubes system backups"), False, False, 0)
+        page.pack_start(label(
+            "Back up qvm-remote configuration (keys, audit log, history), "
+            "push to a Git repository, or trigger a full dom0 system backup.",
+            "explanation"), False, False, 0)
+
+        # Dom0 system backup
+        page.pack_start(section("Dom0 System Backup",
+            "Trigger a full Qubes OS backup (qvm-backup).",
+            tip="Uses qvm-backup to create an encrypted backup of all VMs"), False, False, 0)
+        dc = card()
+        dr = hbox()
+        dr.pack_start(label("Destination:", tip="Directory or device for the backup"), False, False, 0)
+        self._bak_dest = entry("/mnt/backup/",
+            tip="Path in dom0 where the backup will be stored")
+        dr.pack_start(self._bak_dest, True, True, 0)
+        dc.pack_start(dr, False, False, 0)
+        db = hbox()
+        self._bak_dot = StatusDot("Not checked", "unknown",
+            tip="Status of existing backups in the destination")
+        db.pack_start(self._bak_dot, False, False, 0)
+        chk_b = btn("Check", "flat_button",
+            tip="List existing backups and check disk space")
+        chk_b.connect("clicked", lambda _: self._check_bak())
+        db.pack_start(chk_b, False, False, 0)
+        bak_b = btn("Start Backup", "button_save",
+            tip="Begin a full Qubes backup -- this may take hours")
+        bak_b.connect("clicked", self._on_sys_backup)
+        db.pack_start(bak_b, False, False, 0)
+        dc.pack_start(db, False, False, 0)
+        page.pack_start(dc, False, False, 8)
+
+        # Config backup
+        page.pack_start(section("Service Configuration Backup",
+            "Archive remote.conf, VM keys, and daemon log.",
+            tip="Creates a tar.gz of /etc/qubes/remote.conf, /etc/qubes/remote.d/, and the log"), False, False, 0)
+        sc = card()
+        sr = hbox()
+        self._cfg_bak_dir = entry("/var/lib/qvm-remote-backups",
+            tip="Directory where config backups are stored")
+        sr.pack_start(self._cfg_bak_dir, True, True, 0)
+        sb = btn("Create Config Backup", "button_save",
+            tip="Archive the daemon config, VM keys, and log")
+        sb.connect("clicked", self._on_cfg_backup)
+        sr.pack_start(sb, False, False, 0)
+        sc.pack_start(sr, False, False, 0)
+        self._cfg_bak_list = Gtk.ListBox()
+        self._cfg_bak_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._cfg_bak_list.set_tooltip_text("Previous config backups -- select one and click Restore")
+        sc.pack_start(self._cfg_bak_list, False, False, 4)
+        rb = btn("Restore Selected", "flat_button",
+            tip="Restore a previous config backup to /etc/qubes/")
+        rb.connect("clicked", self._on_cfg_restore)
+        sc.pack_start(rb, False, False, 0)
+        page.pack_start(sc, False, False, 8)
+
+        # Git backup
+        page.pack_start(section("Git Repository Backup",
+            "Push audit logs and history to a private Git repository. "
+            "Full authentication keys are never included -- only fingerprints.",
+            tip="Useful for offsite backup of command history and audit trail"), False, False, 0)
+        gc = card()
+        gr = hbox()
+        gr.pack_start(label("Repository URL:",
+            tip="SSH or HTTPS URL of a private Git repository"), False, False, 0)
+        self._git_url = entry("git@github.com:user/qvm-backup.git",
+            tip="Where to push the backup (must be accessible from this VM)")
+        gr.pack_start(self._git_url, True, True, 0)
+        gc.pack_start(gr, False, False, 0)
+        gb = hbox()
+        push_b = btn("Push", "button_save",
+            tip="Commit and push current audit log + history to the remote")
+        push_b.connect("clicked", self._on_git_push)
+        gb.pack_start(push_b, False, False, 0)
+        pull_b = btn("Pull", "flat_button",
+            tip="Pull latest backup data from the remote repository")
+        pull_b.connect("clicked", self._on_git_pull)
+        gb.pack_start(pull_b, False, False, 0)
+        gc.pack_start(gb, False, False, 0)
+        page.pack_start(gc, False, False, 8)
+
+        self._bak_ov = OutputView(100)
+        self._bak_ov.set_tooltip_text("Output from backup operations")
+        page.pack_start(self._bak_ov, True, True, 0)
+
+        sw.add(page)
+        self._nb.append_page(sw, Gtk.Label(label="Backup"))
+
+    def _check_bak(self):
+        rc, out, _ = run_cmd(["bash", "-c",
+            "ls -lhrt /var/lib/qubes/backup* 2>/dev/null | tail -5; "
+            "echo '---'; df -h / | tail -1"], timeout=10)
+        self._bak_ov.set_text(out)
+        if "backup" in out.lower():
+            self._bak_dot.set_state("ok", "Backups found")
+        else:
+            self._bak_dot.set_state("warn", "No backups found")
+
+    def _on_sys_backup(self, _):
+        dest = self._bak_dest.get_text().strip()
+        if not dest:
+            return
+        if not confirm(self, "Start Qubes Backup?",
+                "Destination: {}\nThis may take a very long time.".format(dest)):
+            return
+        AsyncRunner(self._bak_ov).run(["qvm-backup", "--yes", dest])
+        notify("Qubes backup started", "Destination: " + dest, ICON_DISK)
+
+    def _on_cfg_backup(self, _):
+        bak_dir = self._cfg_bak_dir.get_text().strip()
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = os.path.join(bak_dir, "qvm-remote-config-{}.tar.gz".format(ts))
+        def work():
+            import tempfile, shutil, tarfile
+            with tempfile.TemporaryDirectory() as tmp:
+                stage = Path(tmp) / "config"
+                stage.mkdir()
+                for s in [CONF_FILE, LOG_FILE]:
+                    if s.exists():
+                        shutil.copy2(str(s), str(stage / s.name))
+                if KEY_DIR.exists():
+                    shutil.copytree(str(KEY_DIR), str(stage / "remote.d"))
+                try:
+                    Path(bak_dir).mkdir(parents=True, exist_ok=True)
+                    with tarfile.open(dest, "w:gz") as tar:
+                        tar.add(str(stage), arcname="config")
+                    GLib.idle_add(self._bak_ov.set_text, "Saved to " + dest + "\n")
+                    GLib.idle_add(self._refresh_cfg_list)
+                    GLib.idle_add(notify, "Config backed up", dest, ICON_DISK)
+                except Exception as e:
+                    GLib.idle_add(self._bak_ov.set_text, "Error: " + str(e) + "\n")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_cfg_list(self):
+        for ch in self._cfg_bak_list.get_children():
+            self._cfg_bak_list.remove(ch)
+        for path, size, mtime in backup_list(self._cfg_bak_dir.get_text().strip()):
+            row = Gtk.ListBoxRow()
+            row._path = path
+            bx = hbox(12)
+            bx.get_style_context().add_class("permission_row")
+            bx.pack_start(label(os.path.basename(path)), True, True, 0)
+            bx.pack_start(label(size, "explanation"), False, False, 0)
+            bx.pack_start(label(mtime, "explanation"), False, False, 0)
+            row.add(bx)
+            self._cfg_bak_list.add(row)
+        self._cfg_bak_list.show_all()
+
+    def _on_cfg_restore(self, _):
+        row = self._cfg_bak_list.get_selected_row()
+        if not row:
+            show_info(self, "No selection", "Select a backup first.")
+            return
+        if not confirm(self, "Restore config?",
+                "Restore from:\n{}\n\nCurrent config will be overwritten.".format(row._path)):
+            return
+        def work():
+            ok, msg = backup_restore(row._path, "/")
+            GLib.idle_add(self._bak_ov.set_text, msg + "\n")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_git_push(self, _):
+        url = self._git_url.get_text().strip()
+        if not url:
+            show_error(self, "No URL", "Enter a Git repository URL.")
+            return
+        self._bak_ov.set_text("Pushing to Git...\n")
+        def work():
+            ok, msg = git_push(VM_DATA, url)
+            GLib.idle_add(self._bak_ov.append, msg + "\n")
+            if ok:
+                GLib.idle_add(notify, "Git backup pushed", msg, ICON_DISK)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_git_pull(self, _):
+        url = self._git_url.get_text().strip()
+        if not url:
+            return
+        self._bak_ov.set_text("Pulling from Git...\n")
+        def work():
+            ok, msg = git_pull(url, VM_DATA / "git-backup")
+            GLib.idle_add(self._bak_ov.append, msg + "\n")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── (6) Log ───────────────────────────────────────────────────
+
+    def _build_log(self):
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("Daemon Log",
+            tip="View the qvm-remote-dom0 daemon log in real time"), False, False, 0)
+        page.pack_start(label(
+            "The daemon logs every command received, its exit code, duration, "
+            "and any errors. Useful for auditing and debugging.",
+            "explanation"), False, False, 0)
+
+        br = hbox()
+        ref_b = btn("Refresh", "flat_button", "view-refresh-symbolic",
+            tip="Reload the log file from disk")
+        ref_b.connect("clicked", lambda _: self._load_log())
+        br.pack_start(ref_b, False, False, 0)
+        lr = hbox(4)
+        lr.pack_start(label("Show last:", tip="Number of log lines to display"), False, False, 0)
+        self._log_n = Gtk.SpinButton.new_with_range(20, 500, 10)
+        self._log_n.set_value(100)
+        self._log_n.set_tooltip_text("How many lines from the end of the log to show")
+        lr.pack_start(self._log_n, False, False, 0)
+        lr.pack_start(label("lines"), False, False, 0)
+        br.pack_start(lr, False, False, 0)
+        page.pack_start(br, False, False, 8)
+
+        self._log_ov = OutputView(400)
+        self._log_ov.set_tooltip_text("Contents of " + str(LOG_FILE))
+        page.pack_start(self._log_ov, True, True, 0)
+        self._nb.append_page(page, Gtk.Label(label="Log"))
+
+    def _load_log(self):
+        n = int(self._log_n.get_value())
+        if LOG_FILE.exists():
+            try:
+                lines = LOG_FILE.read_text().splitlines()[-n:]
+                self._log_ov.set_text("\n".join(lines))
+            except OSError:
+                self._log_ov.set_text("Could not read log file")
+        else:
+            self._log_ov.set_text("Log not found: " + str(LOG_FILE))
+
+    # ── (7) This Device ───────────────────────────────────────────
+
+    def _build_device(self):
+        page = vbox()
+        page.get_style_context().add_class("content_box")
+        page.pack_start(group_title("This Device",
+            tip="System information about dom0 and the managed VM"), False, False, 0)
+        page.pack_start(label(
+            "Hardware and software information about your Qubes system. "
+            "Useful for debugging or checking resource usage.",
+            "explanation"), False, False, 0)
+
+        dc = card("Dom0 Information",
+            tip="System details gathered from dom0")
+        self._dev_ov = OutputView(200)
+        self._dev_ov.set_tooltip_text("Dom0 hardware and Qubes version info")
+        dc.pack_start(self._dev_ov, True, True, 0)
+        ref_b = btn("Refresh", "flat_button", "view-refresh-symbolic",
+            tip="Re-gather system information")
+        ref_b.connect("clicked", lambda _: self._load_device())
+        dc.pack_start(ref_b, False, False, 4)
+        page.pack_start(dc, False, False, 8)
+
+        page.pack_start(section("VM Status",
+            "Running VMs and resource usage.",
+            tip="Output of qvm-ls --running with memory and class"), False, False, 0)
+        self._vms_ov = OutputView(200)
+        self._vms_ov.set_tooltip_text("qvm-ls output showing running VMs")
+        page.pack_start(self._vms_ov, True, True, 0)
+        self._nb.append_page(page, Gtk.Label(label="This Device"))
+
+    def _load_device(self):
+        import platform
+        lines = ["qvm-remote version: " + UI_VERSION,
+                 "Python: " + platform.python_version(),
+                 "Managed VM: " + MANAGED_VM]
+        rc, out, _ = run_cmd(["bash", "-c",
+            "echo 'Hostname: '$(hostname); "
+            "echo 'Kernel: '$(uname -r); "
+            "xl info 2>/dev/null | grep -E 'total_memory|free_memory|nr_cpus|xen_version' || true; "
+            "echo ''; qubes-prefs 2>/dev/null | head -10 || true"], timeout=10)
+        if rc == 0:
+            lines.append("")
+            lines.append(out.strip())
+        self._dev_ov.set_text("\n".join(lines))
+
+        rc, out, _ = run_cmd(["qvm-ls", "--running", "--fields",
+                               "NAME,CLASS,LABEL,MEM,VCPUS"], timeout=10)
+        self._vms_ov.set_text(out if rc == 0 else "Could not list VMs")
+
+    # ── Tab switch handler ────────────────────────────────────────
+
+    def _on_tab_switch(self, _nb, _page, num):
+        if num == 0:
+            self._refresh_dashboard()
+        elif num == 2:
+            self._refresh_vm_list()
+        elif num == 4:
+            self._check_bak()
+            self._refresh_cfg_list()
+        elif num == 5:
+            self._load_log()
+        elif num == 6:
+            self._load_device()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.qubes.global-admin")
+
+    def do_activate(self):
+        apply_css()
+        win = QubesGlobalAdmin(self)
+        win.show_all()
+        threading.Thread(target=win._start_vm_gui, daemon=True).start()
+
+
+def main():
+    err = check_display()
+    if err:
+        print("qubes-global-admin: " + err, file=sys.stderr)
+        sys.exit(1)
+    app = App()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

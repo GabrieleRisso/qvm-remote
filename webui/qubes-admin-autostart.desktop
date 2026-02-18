@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dom0 - Qubes Global Admin - Autostart
+Comment=Start admin services, web UI, configure workspaces, VM selector
+Exec=/usr/local/bin/qubes-admin-autostart.sh
+OnlyShowIn=XFCE;
+StartupNotify=false
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5

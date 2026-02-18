@@ -71,9 +71,8 @@ COPY --from=builder /build/version /build/version
 COPY test/dom0-sim/test-dom0-sim.sh /tmp/test-dom0-sim.sh
 RUN chmod +x /tmp/test-dom0-sim.sh
 
-# Create log directory (normally created by systemd RuntimeDirectory)
-RUN mkdir -p /var/log/qubes /var/run/qvm-remote
-RUN chmod 700 /var/run/qvm-remote
+# Create log directory (normally created by systemd)
+RUN mkdir -p /var/log/qubes
 
 # Run the full test suite
 RUN /tmp/test-dom0-sim.sh

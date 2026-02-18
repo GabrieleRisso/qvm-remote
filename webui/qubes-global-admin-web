@@ -1,0 +1,2649 @@
+#!/usr/bin/python3
+# qubes-global-admin-web -- Air-gapped web admin for Qubes OS
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Local web admin tool served on 127.0.0.1 in dom0.
+
+Zero external dependencies -- uses only Python stdlib.
+Serves a single-page app with:
+  - Dashboard: daemon status, service control
+  - Execute: run commands in dom0 via qvm-remote
+  - Virtual Machines: authorize/revoke keys, start/stop VMs
+  - Files: push/pull between dom0 and VMs
+  - Backup: system + config backups
+  - Log: daemon log viewer
+  - This Device: system info
+  - OpenClaw: manage multi-agent OpenClaw containers
+
+All API calls are localhost-only. No internet connectivity required.
+"""
+
+import http.server
+import json
+import os
+import re
+import signal
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+VERSION = "1.1.0"
+for d in [os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
+          os.path.dirname(os.path.abspath(__file__)), "/usr/lib/qvm-remote"]:
+    vf = os.path.join(d, "version")
+    if os.path.isfile(vf):
+        try:
+            VERSION = open(vf).read().strip()
+        except OSError:
+            pass
+        break
+
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("QUBES_ADMIN_PORT", "9876"))
+CONF_FILE = "/etc/qubes/remote.conf"
+KEY_DIR = "/etc/qubes/remote.d"
+LOG_FILE = "/var/log/qubes/qvm-remote.log"
+
+# Detect managed VM from config
+def _get_managed_vm():
+    try:
+        for line in open(CONF_FILE).readlines():
+            line = line.strip()
+            if line.startswith("QVM_REMOTE_VMS="):
+                vms = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return vms.split()[0] if vms else "visyble"
+    except OSError:
+        pass
+    return "visyble"
+
+MANAGED_VM = _get_managed_vm()
+POLICY_FILE = "/etc/qubes/remote-admin-policy.json"
+
+
+def run(cmd, timeout=30, shell=False):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, shell=shell)
+        return {"rc": r.returncode, "out": r.stdout, "err": r.stderr}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "out": "", "err": "Command timed out"}
+    except Exception as e:
+        return {"rc": 1, "out": "", "err": str(e)}
+
+
+# ── Policy enforcement engine ────────────────────────────────────
+#
+# Permission levels (cumulative):
+#   deny    — blocked entirely
+#   monitor — read-only: status, list, log, check
+#   manage  — + start/stop, prefs, features, tags, services, firewall
+#   full    — + execute, file transfer, backup, device attach, remove
+#
+# Default policy: dom0 = deny (no modifications), all other VMs = monitor.
+# Specific VMs can be granted higher permissions via the policy file.
+# The "dom0" scope covers direct command execution and dom0 system changes.
+# The "global" scope covers qubes-prefs, dom0-update, policies, xen.
+
+PERM_LEVELS = {"deny": 0, "monitor": 1, "manage": 2, "full": 3}
+
+DEFAULT_POLICY = {
+    "dom0": "deny",
+    "default": "monitor",
+    "vms": {},
+    "dom0_read_allowed": True,
+    "blocked_commands": [
+        "rm -rf /", "dd if=", "mkfs", ":(){:|:&};:",
+        "qvm-remove", "qvm-kill --all",
+    ],
+}
+
+
+def _load_policy():
+    try:
+        with open(POLICY_FILE) as f:
+            p = json.loads(f.read())
+        for k in DEFAULT_POLICY:
+            if k not in p:
+                p[k] = DEFAULT_POLICY[k]
+        return p
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_POLICY)
+
+
+def _save_policy(policy):
+    try:
+        os.makedirs(os.path.dirname(POLICY_FILE), exist_ok=True)
+        with open(POLICY_FILE, "w") as f:
+            json.dump(policy, f, indent=2)
+        os.chmod(POLICY_FILE, 0o600)
+        return True
+    except OSError as e:
+        return False
+
+
+def _get_vm_perm(vm, policy=None):
+    """Get the permission level for a VM."""
+    if policy is None:
+        policy = _load_policy()
+    if vm == "dom0" or vm == "":
+        return policy.get("dom0", "deny")
+    if vm in policy.get("vms", {}):
+        return policy["vms"][vm]
+    return policy.get("default", "monitor")
+
+
+def _perm_value(level):
+    return PERM_LEVELS.get(level, 0)
+
+
+def _check_perm(vm, required_level, policy=None):
+    """Check if operation is allowed. Returns (allowed, error_msg)."""
+    if policy is None:
+        policy = _load_policy()
+    actual = _get_vm_perm(vm, policy)
+    if _perm_value(actual) >= _perm_value(required_level):
+        return True, ""
+    return False, "Policy denied: VM '{}' has '{}' permission, '{}' required".format(
+        vm or "dom0", actual, required_level)
+
+
+def _check_cmd_blocked(cmd, policy=None):
+    """Check if a command matches any blocked pattern."""
+    if policy is None:
+        policy = _load_policy()
+    for pattern in policy.get("blocked_commands", []):
+        if pattern in cmd:
+            return True, "Blocked command pattern: " + pattern
+    return False, ""
+
+
+def _check_dom0_write(policy=None):
+    """Check if dom0 modifications are allowed."""
+    if policy is None:
+        policy = _load_policy()
+    dom0_perm = policy.get("dom0", "deny")
+    return _perm_value(dom0_perm) >= _perm_value("manage")
+
+
+def _check_dom0_read(policy=None):
+    """Check if dom0 read operations are allowed."""
+    if policy is None:
+        policy = _load_policy()
+    if policy.get("dom0_read_allowed", True):
+        return True
+    return _perm_value(policy.get("dom0", "deny")) >= _perm_value("monitor")
+
+
+def _policy_error(msg):
+    return {"rc": 403, "out": "", "err": msg, "policy_denied": True}
+
+
+# ── API handlers ─────────────────────────────────────────────────
+
+def api_status(_params):
+    svc = run(["systemctl", "is-active", "qvm-remote-dom0"], timeout=5)
+    active = svc["out"].strip() == "active"
+    if not active:
+        p = run(["pgrep", "-f", "qvm-remote-dom0"], timeout=3)
+        active = p["rc"] == 0
+    en = run(["systemctl", "is-enabled", "qvm-remote-dom0"], timeout=5)
+    enabled = en["out"].strip() == "enabled"
+    ver = run(["qvm-remote-dom0", "--version"], timeout=5)
+    vm_running = run(["qvm-check", MANAGED_VM, "--running"], timeout=5)
+    conf = ""
+    try:
+        conf = open(CONF_FILE).read()
+    except OSError:
+        conf = "Config not found"
+    return {
+        "daemon_running": active,
+        "daemon_enabled": enabled,
+        "daemon_version": ver["out"].strip() if ver["rc"] == 0 else "unknown",
+        "vm": MANAGED_VM,
+        "vm_running": vm_running["rc"] == 0,
+        "config": conf,
+        "version": VERSION,
+    }
+
+
+def api_service_ctl(params):
+    action = params.get("action", "")
+    if action not in ("start", "stop", "restart", "enable", "disable"):
+        return {"error": "Invalid action"}
+    if not _check_dom0_write():
+        return _policy_error("dom0 service control denied by policy")
+    r = run(["systemctl", action, "qvm-remote-dom0"], timeout=15)
+    return {"rc": r["rc"], "out": r["out"], "err": r["err"]}
+
+
+def api_execute(params):
+    cmd = params.get("cmd", "")
+    timeout = int(params.get("timeout", 300))
+    if not cmd:
+        return {"error": "No command"}
+    policy = _load_policy()
+    blocked, reason = _check_cmd_blocked(cmd, policy)
+    if blocked:
+        return _policy_error(reason)
+    ok, err = _check_perm("dom0", "full", policy)
+    if not ok:
+        return _policy_error(err)
+    r = run(cmd, timeout=timeout, shell=True)
+    return r
+
+
+def api_vm_keys(_params):
+    r = run(["qvm-remote-dom0", "keys"], timeout=10)
+    vms = []
+    if r["rc"] == 0:
+        for line in r["out"].strip().splitlines():
+            line = line.strip()
+            if line:
+                vms.append(line)
+    return {"vms": vms}
+
+
+def api_vm_authorize(params):
+    vm = params.get("vm", "")
+    key = params.get("key", "")
+    if not vm or not key:
+        return {"error": "Missing vm or key"}
+    if not _check_dom0_write():
+        return _policy_error("dom0 key management denied by policy")
+    r = run(["qvm-remote-dom0", "authorize", vm, key], timeout=10)
+    return r
+
+
+def api_vm_revoke(params):
+    vm = params.get("vm", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    if not _check_dom0_write():
+        return _policy_error("dom0 key management denied by policy")
+    r = run(["qvm-remote-dom0", "revoke", vm], timeout=10)
+    return r
+
+
+def api_vm_control(params):
+    vm = params.get("vm", MANAGED_VM)
+    action = params.get("action", "check")
+    if action == "check":
+        ok, err = _check_perm(vm, "monitor")
+        if not ok:
+            return _policy_error(err)
+        r = run(["qvm-check", vm, "--running"], timeout=5)
+        return {"running": r["rc"] == 0, "vm": vm}
+    ok, err = _check_perm(vm, "manage")
+    if not ok:
+        return _policy_error(err)
+    if action == "start":
+        r = run(["qvm-start", vm], timeout=60)
+    elif action == "stop":
+        r = run(["qvm-shutdown", "--wait", "--timeout", "90", vm], timeout=120)
+    else:
+        return {"error": "Invalid action"}
+    return r
+
+
+def api_file_push(params):
+    vm = params.get("vm", MANAGED_VM)
+    src = params.get("src", "")
+    dst = params.get("dst", "")
+    if not src or not dst:
+        return {"error": "Missing src or dst"}
+    ok, err = _check_perm(vm, "full")
+    if not ok:
+        return _policy_error(err)
+    r = run("cat '{}' | qvm-run --pass-io --no-gui {} 'cat > \"{}\"'".format(
+        src, vm, dst), timeout=60, shell=True)
+    return r
+
+
+def api_file_pull(params):
+    vm = params.get("vm", MANAGED_VM)
+    src = params.get("src", "")
+    dst = params.get("dst", "")
+    if not src or not dst:
+        return {"error": "Missing src or dst"}
+    ok, err = _check_perm(vm, "full")
+    if not ok:
+        return _policy_error(err)
+    r = run("qvm-run --pass-io --no-gui {} 'cat \"{}\"' > '{}'".format(
+        vm, src, dst), timeout=60, shell=True)
+    return r
+
+
+def api_backup_status(_params):
+    r = run("ls -lhrt /var/lib/qubes/backup* 2>/dev/null | tail -5; "
+            "echo '---'; df -h / | tail -1", timeout=10, shell=True)
+    return {"out": r["out"]}
+
+
+def api_backup_start(params):
+    dest = params.get("dest", "/mnt/backup/")
+    if not _check_dom0_write():
+        return _policy_error("dom0 backup operations denied by policy")
+    r = run(["qvm-backup", "--yes", dest], timeout=7200)
+    return r
+
+
+def api_log(params):
+    n = int(params.get("lines", 100))
+    try:
+        lines = open(LOG_FILE).readlines()[-n:]
+        return {"log": "".join(lines)}
+    except OSError:
+        return {"log": "Log not found: " + LOG_FILE}
+
+
+def api_device(_params):
+    info = run("echo 'Hostname: '$(hostname); echo 'Kernel: '$(uname -r); "
+               "xl info 2>/dev/null | grep -E 'total_memory|free_memory|nr_cpus|xen_version' || true; "
+               "echo ''; qubes-prefs 2>/dev/null | head -10 || true",
+               timeout=10, shell=True)
+    vms = run(["qvm-ls", "--running", "--fields", "NAME,CLASS,LABEL,MEM,VCPUS"], timeout=10)
+    return {"info": info["out"], "vms": vms["out"] if vms["rc"] == 0 else "Could not list VMs"}
+
+
+def api_openclaw_status(_params):
+    """Check OpenClaw containers and health."""
+    results = {}
+    for eng in ["podman", "docker"]:
+        r = run([eng, "ps", "--filter", "name=openclaw", "--format",
+                 "{{.Names}}\t{{.Status}}\t{{.Ports}}"], timeout=10)
+        if r["rc"] == 0 and r["out"].strip():
+            results["engine"] = eng
+            results["containers"] = []
+            for line in r["out"].strip().splitlines():
+                parts = line.split("\t")
+                results["containers"].append({
+                    "name": parts[0] if parts else "",
+                    "status": parts[1] if len(parts) > 1 else "",
+                    "ports": parts[2] if len(parts) > 2 else "",
+                })
+            break
+    if not results:
+        results = {"engine": "none", "containers": []}
+    health = run(["curl", "-sf", "--max-time", "3",
+                   "http://127.0.0.1:32125/health"], timeout=5)
+    results["proxy_healthy"] = health["rc"] == 0
+    results["proxy_response"] = health["out"].strip() if health["rc"] == 0 else ""
+    gw = run(["curl", "-sf", "--max-time", "3",
+               "http://127.0.0.1:18789/"], timeout=5)
+    results["gateway_healthy"] = gw["rc"] == 0
+    return results
+
+
+def api_openclaw_control(params):
+    action = params.get("action", "")
+    if action != "logs" and not _check_dom0_write():
+        return _policy_error("dom0 container control denied by policy")
+    eng = "podman" if run(["which", "podman"], timeout=3)["rc"] == 0 else "docker"
+    if action == "start":
+        r = run([eng, "compose", "up", "-d"], timeout=120)
+        return r
+    elif action == "stop":
+        r = run([eng, "compose", "down"], timeout=60)
+        return r
+    elif action == "restart":
+        run([eng, "compose", "down"], timeout=60)
+        r = run([eng, "compose", "up", "-d"], timeout=120)
+        return r
+    elif action == "logs":
+        r = run([eng, "compose", "logs", "--tail", "50"], timeout=15)
+        return r
+    return {"error": "Invalid action"}
+
+
+def api_openclaw_vm(params):
+    """Manage OpenClaw containers inside a VM (run via qvm-run)."""
+    vm = params.get("vm", MANAGED_VM)
+    action = params.get("action", "status")
+    required = "monitor" if action == "status" else "manage"
+    ok, err = _check_perm(vm, required)
+    if not ok:
+        return _policy_error(err)
+    if action == "status":
+        r = run("qvm-run --pass-io --no-gui {} 'curl -sf --max-time 3 http://127.0.0.1:32125/health 2>/dev/null && echo PROXY_OK || echo PROXY_DOWN; "
+                "curl -sf --max-time 3 http://127.0.0.1:18789/ >/dev/null 2>&1 && echo GW_OK || echo GW_DOWN; "
+                "systemctl --user is-active openclaw-cursor-proxy 2>/dev/null || echo inactive; "
+                "systemctl --user is-active openclaw-gateway 2>/dev/null || echo inactive; "
+                "for eng in podman docker; do "
+                "  $eng ps --filter name=openclaw --format \"{{{{.Names}}}}\\t{{{{.Status}}}}\" 2>/dev/null && break; "
+                "done'".format(vm), timeout=15, shell=True)
+        return r
+    elif action == "start":
+        r = run("qvm-run --pass-io --no-gui {} '"
+                "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
+                "eng=$(command -v podman || command -v docker); "
+                "$eng compose up -d 2>&1 || "
+                "(systemctl --user start openclaw-cursor-proxy 2>/dev/null; "
+                "systemctl --user start openclaw-gateway 2>/dev/null); "
+                "echo DONE'".format(vm), timeout=120, shell=True)
+        return r
+    elif action == "stop":
+        r = run("qvm-run --pass-io --no-gui {} '"
+                "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
+                "eng=$(command -v podman || command -v docker); "
+                "$eng compose down 2>&1 || "
+                "(systemctl --user stop openclaw-cursor-proxy 2>/dev/null; "
+                "systemctl --user stop openclaw-gateway 2>/dev/null); "
+                "echo DONE'".format(vm), timeout=60, shell=True)
+        return r
+    elif action == "logs":
+        r = run("qvm-run --pass-io --no-gui {} '"
+                "cd ~/qubes-claw/openclaw 2>/dev/null || cd ~/openclaw-cursor 2>/dev/null || true; "
+                "eng=$(command -v podman || command -v docker); "
+                "$eng compose logs --tail 50 2>&1 || "
+                "journalctl --user -u openclaw-cursor-proxy -u openclaw-gateway --no-pager -n 50 2>/dev/null'".format(vm),
+                timeout=15, shell=True)
+        return r
+    return {"error": "Invalid action"}
+
+
+def api_container_logs(params):
+    """Get logs from a specific container (dom0 or VM)."""
+    container = params.get("container", "")
+    vm = params.get("vm", "")
+    lines = params.get("lines", "50")
+    eng = "podman" if run(["which", "podman"], timeout=3)["rc"] == 0 else "docker"
+    if vm:
+        r = run("qvm-run --pass-io --no-gui {} '"
+                "eng=$(command -v podman || command -v docker); "
+                "$eng logs --tail {} {} 2>&1'".format(vm, lines, container),
+                timeout=15, shell=True)
+    else:
+        if not container:
+            return {"error": "Missing container name"}
+        r = run([eng, "logs", "--tail", str(lines), container], timeout=15)
+    return r
+
+
+def api_vm_log(params):
+    """Per-VM qvm-remote command history with separate logs."""
+    vm = params.get("vm", "")
+    lines = int(params.get("lines", 50))
+    if not vm:
+        try:
+            all_log = open(LOG_FILE).read()
+            return {"log": all_log[-10000:]}
+        except OSError:
+            return {"log": "Log not found"}
+    try:
+        content = open(LOG_FILE).readlines()
+        filtered = [l for l in content if "vm=" + vm in l]
+        return {"log": "".join(filtered[-lines:])}
+    except OSError:
+        return {"log": "Log not found"}
+
+
+def api_autostart_log(_params):
+    """Read the autostart log from last login."""
+    try:
+        return {"log": open("/tmp/dom0-admin-autostart.log").read()}
+    except OSError:
+        return {"log": "No autostart log found"}
+
+
+def api_qvm_ls(_params):
+    r = run(["qvm-ls", "--fields", "NAME,CLASS,LABEL,STATE,MEM,VCPUS,NETVM",
+             "--raw-data"], timeout=10)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_queue_health(_params):
+    """Report queue state across all authorized VMs for dashboard monitoring."""
+    r = run(["qvm-remote-dom0", "queue", "status"], timeout=15)
+    return {"out": r["out"], "rc": r["rc"], "err": r["err"]}
+
+
+def api_queue_action(params):
+    """Queue management: clean, recover, debug."""
+    action = params.get("action", "status")
+    vm = params.get("vm", "")
+    if action not in ("status", "clean", "recover", "debug"):
+        return {"error": "Invalid action"}
+    if action != "status" and not _check_dom0_write():
+        return _policy_error("dom0 queue management denied by policy")
+    cmd = ["qvm-remote-dom0", "queue", action]
+    if vm:
+        cmd.append(vm)
+    r = run(cmd, timeout=30)
+    return r
+
+
+def api_admin_policy(params):
+    """Manage the admin policy: read, update VM permissions, set dom0 level."""
+    action = params.get("action", "get")
+
+    if action == "get":
+        policy = _load_policy()
+        all_vms = run(["qvm-ls", "--raw-list"], timeout=10)
+        vm_list = []
+        if all_vms["rc"] == 0:
+            vm_list = [v.strip() for v in all_vms["out"].strip().splitlines() if v.strip()]
+        return {"policy": policy, "available_vms": vm_list}
+
+    if action == "set_vm":
+        vm = params.get("vm", "")
+        level = params.get("level", "")
+        if not vm or level not in PERM_LEVELS:
+            return {"error": "Missing vm or invalid level (deny/monitor/manage/full)"}
+        policy = _load_policy()
+        if "vms" not in policy:
+            policy["vms"] = {}
+        policy["vms"][vm] = level
+        if _save_policy(policy):
+            return {"ok": True, "vm": vm, "level": level}
+        return {"error": "Failed to save policy"}
+
+    if action == "remove_vm":
+        vm = params.get("vm", "")
+        if not vm:
+            return {"error": "Missing vm"}
+        policy = _load_policy()
+        if vm in policy.get("vms", {}):
+            del policy["vms"][vm]
+            if _save_policy(policy):
+                return {"ok": True, "removed": vm}
+        return {"error": "VM not in policy or save failed"}
+
+    if action == "set_dom0":
+        level = params.get("level", "")
+        if level not in PERM_LEVELS:
+            return {"error": "Invalid level"}
+        policy = _load_policy()
+        policy["dom0"] = level
+        if _save_policy(policy):
+            return {"ok": True, "dom0": level}
+        return {"error": "Failed to save policy"}
+
+    if action == "set_default":
+        level = params.get("level", "")
+        if level not in PERM_LEVELS:
+            return {"error": "Invalid level"}
+        policy = _load_policy()
+        policy["default"] = level
+        if _save_policy(policy):
+            return {"ok": True, "default": level}
+        return {"error": "Failed to save policy"}
+
+    if action == "set_dom0_read":
+        val = params.get("value", "true") == "true"
+        policy = _load_policy()
+        policy["dom0_read_allowed"] = val
+        if _save_policy(policy):
+            return {"ok": True, "dom0_read_allowed": val}
+        return {"error": "Failed to save policy"}
+
+    if action == "set_blocked":
+        cmds = params.get("commands", "")
+        if not cmds:
+            return {"error": "Missing commands"}
+        policy = _load_policy()
+        policy["blocked_commands"] = [c.strip() for c in cmds.split("\n") if c.strip()]
+        if _save_policy(policy):
+            return {"ok": True}
+        return {"error": "Failed to save policy"}
+
+    if action == "reset":
+        if _save_policy(dict(DEFAULT_POLICY)):
+            return {"ok": True, "policy": DEFAULT_POLICY}
+        return {"error": "Failed to reset policy"}
+
+    return {"error": "Invalid action"}
+
+
+def api_connect(params):
+    """Connect a new VM: authorize + add to config + init dirs."""
+    vm = params.get("vm", "")
+    key = params.get("key", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    if not _check_dom0_write():
+        return _policy_error("dom0 VM connection management denied by policy")
+    cmd = ["qvm-remote-dom0", "connect", vm]
+    if key:
+        cmd.append(key)
+    r = run(cmd, timeout=30)
+    return r
+
+
+def api_disconnect(params):
+    """Disconnect a VM: revoke + remove from config + clean queue."""
+    vm = params.get("vm", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    if not _check_dom0_write():
+        return _policy_error("dom0 VM disconnection denied by policy")
+    r = run(["qvm-remote-dom0", "disconnect", vm], timeout=30)
+    return r
+
+
+def api_daemon_status(_params):
+    """Full daemon status report."""
+    r = run(["qvm-remote-dom0", "status"], timeout=15)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_vm_prefs(params):
+    vm = params.get("vm", "")
+    prop = params.get("prop", "")
+    val = params.get("val", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    if prop and val:
+        ok, err = _check_perm(vm, "manage")
+        if not ok:
+            return _policy_error(err)
+        r = run(["qvm-prefs", vm, prop, val], timeout=10)
+        return r
+    ok, err = _check_perm(vm, "monitor")
+    if not ok:
+        return _policy_error(err)
+    if prop:
+        r = run(["qvm-prefs", vm, prop], timeout=10)
+        return {"value": r["out"].strip(), "rc": r["rc"]}
+    r = run(["qvm-prefs", vm], timeout=10)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_qubes_prefs(params):
+    prop = params.get("prop", "")
+    val = params.get("val", "")
+    if prop and val:
+        if not _check_dom0_write():
+            return _policy_error("dom0 global preferences modification denied by policy")
+        r = run(["qubes-prefs", prop, val], timeout=10)
+        return r
+    if not _check_dom0_read():
+        return _policy_error("dom0 read denied by policy")
+    if prop:
+        r = run(["qubes-prefs", prop], timeout=10)
+        return {"value": r["out"].strip(), "rc": r["rc"]}
+    r = run(["qubes-prefs"], timeout=10)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_firewall(params):
+    vm = params.get("vm", "")
+    action = params.get("action", "list")
+    if not vm:
+        return {"error": "Missing vm"}
+    required = "monitor" if action == "list" else "manage"
+    ok, err = _check_perm(vm, required)
+    if not ok:
+        return _policy_error(err)
+    if action == "list":
+        r = run(["qvm-firewall", vm, "list"], timeout=10)
+    elif action == "reset":
+        r = run(["qvm-firewall", vm, "reset"], timeout=10)
+    elif action == "add":
+        rule = params.get("rule", "")
+        if not rule:
+            return {"error": "Missing rule"}
+        r = run("qvm-firewall {} add {}".format(vm, rule), timeout=10, shell=True)
+    else:
+        return {"error": "Invalid action"}
+    return r
+
+
+def api_devices(params):
+    dtype = params.get("type", "usb")
+    if dtype not in ("usb", "pci", "block", "mic"):
+        return {"error": "Invalid type"}
+    if not _check_dom0_read():
+        return _policy_error("dom0 device listing denied by policy")
+    r = run(["qvm-device", dtype, "list"], timeout=10)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_device_ctl(params):
+    dtype = params.get("type", "usb")
+    action = params.get("action", "")
+    vm = params.get("vm", "")
+    port = params.get("port", "")
+    if not action or not vm or not port:
+        return {"error": "Missing action/vm/port"}
+    ok, err = _check_perm(vm, "full")
+    if not ok:
+        return _policy_error(err)
+    if action == "attach":
+        r = run(["qvm-device", dtype, "attach", vm, port], timeout=30)
+    elif action == "detach":
+        r = run(["qvm-device", dtype, "detach", vm, port], timeout=15)
+    else:
+        return {"error": "Invalid action"}
+    return r
+
+
+def api_features(params):
+    vm = params.get("vm", "")
+    feat = params.get("feature", "")
+    val = params.get("value", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    if feat and val:
+        ok, err = _check_perm(vm, "manage")
+        if not ok:
+            return _policy_error(err)
+        r = run(["qvm-features", vm, feat, val], timeout=10)
+        return r
+    ok, err = _check_perm(vm, "monitor")
+    if not ok:
+        return _policy_error(err)
+    if feat:
+        r = run(["qvm-features", vm, feat], timeout=10)
+        return {"value": r["out"].strip(), "rc": r["rc"]}
+    r = run(["qvm-features", vm], timeout=10)
+    return {"out": r["out"], "rc": r["rc"]}
+
+
+def api_tags(params):
+    vm = params.get("vm", "")
+    action = params.get("action", "list")
+    tag = params.get("tag", "")
+    if not vm:
+        return {"error": "Missing vm"}
+    required = "monitor" if action == "list" else "manage"
+    ok, err = _check_perm(vm, required)
+    if not ok:
+        return _policy_error(err)
+    if action == "list":
+        r = run(["qvm-tags", vm], timeout=10)
+    elif action == "add" and tag:
+        r = run(["qvm-tags", vm, "add", tag], timeout=10)
+    elif action == "del" and tag:
+        r = run(["qvm-tags", vm, "del", tag], timeout=10)
+    else:
+        return {"error": "Invalid action/tag"}
+    return r
+
+
+def api_services(params):
+    vm = params.get("vm", "")
+    svc = params.get("service", "")
+    action = params.get("action", "list")
+    if not vm:
+        return {"error": "Missing vm"}
+    required = "monitor" if action == "list" else "manage"
+    ok, err = _check_perm(vm, required)
+    if not ok:
+        return _policy_error(err)
+    if action == "list":
+        r = run(["qvm-service", vm], timeout=10)
+    elif action == "enable" and svc:
+        r = run(["qvm-service", vm, svc, "--enable"], timeout=10)
+    elif action == "disable" and svc:
+        r = run(["qvm-service", vm, svc, "--disable"], timeout=10)
+    elif action == "default" and svc:
+        r = run(["qvm-service", vm, svc, "--default"], timeout=10)
+    else:
+        return {"error": "Invalid action/service"}
+    return r
+
+
+def api_templates(_params):
+    if not _check_dom0_read():
+        return _policy_error("dom0 read denied by policy")
+    installed = run(["qvm-template", "list", "--installed"], timeout=30)
+    return {"out": installed["out"], "rc": installed["rc"]}
+
+
+def api_policy(params):
+    action = params.get("action", "list")
+    if not _check_dom0_read():
+        return _policy_error("dom0 policy read denied")
+    if action == "list":
+        r = run("ls -la /etc/qubes/policy.d/ 2>/dev/null", timeout=5, shell=True)
+        return {"out": r["out"]}
+    name = params.get("name", "")
+    if action == "read" and name:
+        name = os.path.basename(name)
+        path = "/etc/qubes/policy.d/" + name
+        try:
+            return {"out": open(path).read()}
+        except OSError as e:
+            return {"error": str(e)}
+    return {"error": "Invalid action"}
+
+
+def api_dom0_update(params):
+    action = params.get("action", "check")
+    if action == "update":
+        if not _check_dom0_write():
+            return _policy_error("dom0 update denied by policy")
+    elif action != "check":
+        return {"error": "Invalid action"}
+    if action == "check":
+        r = run(["qubes-dom0-update", "--check-only"], timeout=120)
+    else:
+        r = run(["qubes-dom0-update", "-y"], timeout=600)
+    return r
+
+
+def api_xen(_params):
+    info = run("xl info 2>/dev/null", timeout=10, shell=True)
+    vlist = run("xl list 2>/dev/null", timeout=10, shell=True)
+    uptime = run("xl uptime 2>/dev/null", timeout=10, shell=True)
+    return {
+        "info": info["out"],
+        "list": vlist["out"],
+        "uptime": uptime["out"],
+    }
+
+
+ROUTES = {
+    "/api/status": api_status,
+    "/api/service": api_service_ctl,
+    "/api/execute": api_execute,
+    "/api/vm/keys": api_vm_keys,
+    "/api/vm/authorize": api_vm_authorize,
+    "/api/vm/revoke": api_vm_revoke,
+    "/api/vm/control": api_vm_control,
+    "/api/vm/prefs": api_vm_prefs,
+    "/api/file/push": api_file_push,
+    "/api/file/pull": api_file_pull,
+    "/api/backup/status": api_backup_status,
+    "/api/backup/start": api_backup_start,
+    "/api/log": api_log,
+    "/api/device": api_device,
+    "/api/devices": api_devices,
+    "/api/devices/ctl": api_device_ctl,
+    "/api/openclaw/status": api_openclaw_status,
+    "/api/openclaw/control": api_openclaw_control,
+    "/api/openclaw/vm": api_openclaw_vm,
+    "/api/container/logs": api_container_logs,
+    "/api/vm-log": api_vm_log,
+    "/api/autostart-log": api_autostart_log,
+    "/api/qubes-prefs": api_qubes_prefs,
+    "/api/firewall": api_firewall,
+    "/api/features": api_features,
+    "/api/tags": api_tags,
+    "/api/services": api_services,
+    "/api/templates": api_templates,
+    "/api/policy": api_policy,
+    "/api/dom0-update": api_dom0_update,
+    "/api/xen": api_xen,
+    "/api/qvm-ls": api_qvm_ls,
+    "/api/queue-health": api_queue_health,
+    "/api/queue": api_queue_action,
+    "/api/connect": api_connect,
+    "/api/disconnect": api_disconnect,
+    "/api/daemon-status": api_daemon_status,
+    "/api/admin-policy": api_admin_policy,
+}
+
+
+# ── HTTP Server ──────────────────────────────────────────────────
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:" + str(PORT))
+        self.send_header("Cache-Control", "no-cache")
+
+    def _json_response(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/" or parsed.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(HTML.encode())
+            return
+        if parsed.path == "/api/stream/exec":
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            self._stream_exec(params)
+            return
+        if parsed.path in ROUTES:
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            result = ROUTES[parsed.path](params)
+            status = 403 if result.get("policy_denied") else 200
+            self._json_response(status, result)
+            return
+        self.send_error(404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ROUTES:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else "{}"
+            try:
+                params = json.loads(body)
+            except json.JSONDecodeError:
+                params = dict(urllib.parse.parse_qsl(body))
+            result = ROUTES[parsed.path](params)
+            status = 403 if result.get("policy_denied") else 200
+            self._json_response(status, result)
+            return
+        self.send_error(404)
+
+    def _stream_exec(self, params):
+        """Server-Sent Events: stream command output line by line."""
+        cmd = params.get("cmd", "")
+        timeout = int(params.get("timeout", 300))
+        if not cmd:
+            self.send_error(400, "No command")
+            return
+        policy = _load_policy()
+        blocked, reason = _check_cmd_blocked(cmd, policy)
+        if blocked:
+            self._json_response(403, _policy_error(reason))
+            return
+        ok, err = _check_perm("dom0", "full", policy)
+        if not ok:
+            self._json_response(403, _policy_error(err))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self._cors()
+        self.end_headers()
+        try:
+            proc = subprocess.Popen(
+                cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+            for line in proc.stdout:
+                self.wfile.write(("data: " + json.dumps({"line": line}) + "\n\n").encode())
+                self.wfile.flush()
+            proc.wait(timeout=timeout + 5)
+            self.wfile.write(("data: " + json.dumps(
+                {"done": True, "rc": proc.returncode}) + "\n\n").encode())
+            self.wfile.flush()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.wfile.write(("data: " + json.dumps(
+                {"done": True, "rc": 124, "line": "Timed out\n"}) + "\n\n").encode())
+            self.wfile.flush()
+        except Exception as e:
+            try:
+                self.wfile.write(("data: " + json.dumps(
+                    {"done": True, "rc": 1, "line": str(e) + "\n"}) + "\n\n").encode())
+                self.wfile.flush()
+            except Exception:
+                pass
+
+
+class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+# ── HTML / CSS / JS (single-page app) ────────────────────────────
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qubes Global Admin</title>
+<style>
+:root {
+  --blue: #4180c9;
+  --dark-blue: #4488df;
+  --bg: #f2f2f2;
+  --bg-white: #ffffff;
+  --frame: #979797;
+  --sep: #cdcdcd;
+  --soft: #858585;
+  --misc: #979797;
+  --text: #000000;
+  --ok: #2d8a4e;
+  --warn: #d4a017;
+  --err: #c0392b;
+  --info-bg: #f0e9e3;
+  --problem-bg: #fce9e3;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Source Sans Pro', 'Cantarell', 'Segoe UI', sans-serif;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Title bar */
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 24px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--sep);
+}
+.titlebar h1 { font-size: 18px; font-weight: 700; }
+.titlebar .ver { font-size: 12px; color: var(--soft); font-weight: 600; }
+
+/* Connection bar */
+.connbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 24px;
+  border-bottom: 1px solid var(--sep);
+  font-size: 13px;
+  transition: background 0.3s;
+}
+.connbar.ok { background: #e6f4ea; }
+.connbar.warn { background: var(--info-bg); }
+.connbar.err { background: var(--problem-bg); }
+.connbar .dot { font-size: 16px; }
+.connbar .dot.ok { color: var(--ok); }
+.connbar .dot.warn { color: var(--warn); }
+.connbar .dot.err { color: var(--err); }
+.connbar .vm { margin-left: auto; font-weight: 600; color: var(--soft); }
+
+/* Layout */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar {
+  width: 200px;
+  min-width: 200px;
+  background: var(--bg);
+  border-right: 1px solid var(--sep);
+  display: flex;
+  flex-direction: column;
+}
+.sidebar .tab {
+  padding: 14px 24px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  text-align: left;
+  color: var(--text);
+  border-bottom: 1px solid var(--sep);
+  transition: background 0.15s;
+}
+.sidebar .tab:hover { background: #e7e7e7; }
+.sidebar .tab.active { background: var(--blue); color: white; }
+
+/* Content */
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 50px 100px;
+  background: var(--bg);
+}
+@media (max-width: 900px) { .content { padding: 20px 24px; } }
+
+.page { display: none; }
+.page.active { display: block; }
+
+/* Typography */
+h2 { font-weight: 400; font-size: 22px; margin-bottom: 4px; }
+h3 { font-weight: 700; font-size: 15px; margin-top: 24px; margin-bottom: 4px; }
+.expl { font-size: 12px; color: var(--misc); margin-bottom: 16px; margin-left: 2px; }
+
+/* Cards */
+.card {
+  background: var(--bg-white);
+  border: 1px solid var(--sep);
+  border-radius: 5px;
+  padding: 16px 20px;
+  margin: 10px 0;
+}
+.card-title { font-weight: 700; font-size: 13px; color: var(--soft); margin-bottom: 8px; }
+
+/* Status dots */
+.dot-inline { display: inline-flex; align-items: center; gap: 6px; }
+.dot-inline .d { font-size: 14px; }
+.dot-inline .d.ok { color: var(--ok); }
+.dot-inline .d.warn { color: var(--warn); }
+.dot-inline .d.err { color: var(--err); }
+
+/* Buttons */
+button, .btn {
+  padding: 6px 18px;
+  border: 1px solid var(--sep);
+  background: var(--bg);
+  color: var(--text);
+  font-weight: 500;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 0;
+  margin: 4px;
+  font-family: inherit;
+}
+button:hover { background: #e7e7e7; }
+.btn-primary { background: var(--dark-blue); color: white; border-color: var(--dark-blue); font-weight: 600; }
+.btn-primary:hover { background: var(--blue); }
+.btn-danger { background: var(--problem-bg); color: var(--err); border-color: var(--err); font-weight: 600; }
+
+/* Inputs */
+input[type="text"], input[type="number"], textarea {
+  padding: 6px 10px;
+  border: 1px solid var(--sep);
+  border-radius: 0;
+  font-size: 13px;
+  font-family: inherit;
+  width: 100%;
+}
+input:focus, textarea:focus { border-color: var(--blue); outline: none; }
+
+/* Output */
+.output {
+  background: var(--bg-white);
+  border: 1px solid var(--sep);
+  padding: 10px;
+  font-family: 'Source Code Pro', 'Consolas', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 400px;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+
+/* Row layout */
+.row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+.row label { font-weight: 500; white-space: nowrap; min-width: 100px; }
+.row input { flex: 1; min-width: 120px; }
+
+/* Permission list */
+.perm-list { border: 1px solid var(--sep); margin: 8px 0; max-height: 200px; overflow-y: auto; }
+.perm-row {
+  display: flex; align-items: center; padding: 8px 16px;
+  background: var(--bg-white); border-bottom: 1px solid var(--sep);
+  cursor: pointer;
+}
+.perm-row:hover { background: #e8f0fe; }
+.perm-row.selected { background: var(--blue); color: white; }
+
+/* Tooltip */
+[title] { position: relative; }
+
+/* Info box */
+.info-box {
+  background: var(--info-bg);
+  border: 1px solid var(--frame);
+  padding: 12px 20px;
+  margin: 10px 0;
+  border-radius: 0;
+  font-size: 13px;
+}
+
+/* Spinner */
+.spin { display: inline-block; width: 14px; height: 14px;
+  border: 2px solid var(--sep); border-top-color: var(--blue);
+  border-radius: 50%; animation: spin .6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Docs toggle */
+details { margin: 8px 0; }
+details summary { cursor: pointer; font-weight: 600; color: var(--blue); font-size: 13px; }
+details summary:hover { text-decoration: underline; }
+details .doc-content { padding: 10px; background: var(--bg-white); border: 1px solid var(--sep);
+  margin-top: 4px; font-size: 13px; line-height: 1.5; }
+details .doc-content code { background: #f2f2f2; padding: 1px 4px; font-family: 'Source Code Pro', monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="titlebar">
+  <h1>Qubes Global Admin</h1>
+  <span class="ver" id="version">v""" + VERSION + r"""</span>
+</div>
+
+<div class="connbar warn" id="connbar">
+  <span class="dot d warn" id="conn-dot">&#x25cf;</span>
+  <span id="conn-text">Checking connection...</span>
+  <span class="vm" id="conn-vm">VM: """ + MANAGED_VM + r"""</span>
+</div>
+
+<div class="main">
+  <nav class="sidebar" id="sidebar">
+    <button class="tab active" data-page="dashboard" title="Daemon status, service control, autostart">Dashboard</button>
+    <button class="tab" data-page="execute" title="Run shell commands in dom0 via qvm-remote">Execute</button>
+    <button class="tab" data-page="vms" title="Manage authorized VMs, keys, VM lifecycle">Virtual Machines</button>
+    <button class="tab" data-page="files" title="Transfer files between dom0 and VMs">Files</button>
+    <button class="tab" data-page="backup" title="System and config backups">Backup</button>
+    <button class="tab" data-page="log" title="View the qvm-remote-dom0 daemon log">Log</button>
+    <button class="tab" data-page="device" title="Dom0 hardware info and running VMs">This Device</button>
+    <button class="tab" data-page="openclaw" title="OpenClaw multi-agent container management">OpenClaw</button>
+    <button class="tab" data-page="globalcfg" title="Qubes OS global preferences and settings">Global Config</button>
+    <button class="tab" data-page="advanced" title="Firewall, devices, features, tags, services, policies">Advanced</button>
+    <button class="tab" data-page="policy" title="Restrict command execution per VM pool &#8212; dom0 protection, selective permissions" style="border-top:1px solid var(--border)">Policy Enforcer</button>
+  </nav>
+
+  <div class="content">
+
+    <!-- ═══ Dashboard ═══ -->
+    <div class="page active" id="page-dashboard">
+      <h2 title="Monitor and control the qvm-remote dom0 daemon">Service Dashboard</h2>
+      <p class="expl">The qvm-remote daemon runs in dom0 and executes authenticated commands from authorized VMs. Start, stop, or configure it here.</p>
+
+      <div class="card">
+        <div class="card-title">Service Status</div>
+        <div class="dot-inline" id="svc-status">
+          <span class="d warn">&#x25cf;</span> <span>Checking...</span>
+        </div>
+        <div style="margin-top:4px;font-size:12px;color:var(--soft)" id="svc-version"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn-primary" onclick="svcCtl('start')" title="Start the daemon via systemctl">Start</button>
+          <button class="btn-danger" onclick="if(confirm('Stop daemon? VMs cannot run commands until restarted.'))svcCtl('stop')" title="Stop the daemon">Stop</button>
+          <button onclick="svcCtl('restart')" title="Restart the daemon (stop + start)">Restart</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Autostart</div>
+        <p class="expl">When enabled, the daemon starts automatically on every boot via systemd. Authorized VMs can submit commands at all times.</p>
+        <div class="dot-inline" id="auto-status">
+          <span class="d warn">&#x25cf;</span> <span>Unknown</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="if(confirm('Enable autostart? Daemon runs on every boot.'))svcCtl('enable')" title="Enable auto-start on boot">Enable</button>
+          <button onclick="svcCtl('disable')" title="Disable auto-start">Disable</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Queue Health</div>
+        <div class="dot-inline" id="queue-status">
+          <span class="d warn">&#x25cf;</span> <span>Checking...</span>
+        </div>
+        <div class="output" id="queue-detail" style="max-height:120px;margin-top:8px;font-size:12px">Loading...</div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="queueAction('status')" title="Refresh queue counts">Refresh</button>
+          <button class="btn-primary" onclick="queueAction('recover')" title="Fail stuck running commands (returns error to waiting clients)">Recover Stuck</button>
+          <button class="btn-danger" onclick="if(confirm('Clean ALL queues? Active commands will be lost.'))queueAction('clean')" title="Remove ALL queue files across all VMs">Clean All</button>
+          <button onclick="queueAction('debug')" title="Detailed queue dump for troubleshooting">Debug Dump</button>
+        </div>
+        <div class="output" id="queue-action-output" style="max-height:200px;display:none"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Configuration</div>
+        <details>
+          <summary>What is this?</summary>
+          <div class="doc-content">
+            <code>/etc/qubes/remote.conf</code> lists the VMs that the daemon polls for commands.
+            Edit it manually or use the Virtual Machines tab to authorize VMs.
+          </div>
+        </details>
+        <div class="output" id="config-view" style="max-height:150px">Loading...</div>
+      </div>
+    </div>
+
+    <!-- ═══ Execute ═══ -->
+    <div class="page" id="page-execute">
+      <h2 title="Run commands in dom0 via the authenticated qvm-remote channel">Execute Command in Dom0</h2>
+      <p class="expl">Commands are sent from the managed VM to dom0, authenticated with HMAC-SHA256, and executed by the daemon. Output appears below.</p>
+
+      <details>
+        <summary>Command examples &amp; documentation</summary>
+        <div class="doc-content">
+          <strong>Common commands:</strong><br>
+          <code>qvm-ls --running</code> -- list running VMs<br>
+          <code>xl info | grep total_memory</code> -- Xen memory info<br>
+          <code>qvm-prefs work memory 4096</code> -- set VM memory<br>
+          <code>qvm-start work</code> / <code>qvm-shutdown --wait work</code> -- VM lifecycle<br>
+          <code>systemctl status qubesd</code> -- check qubesd<br>
+          <code>qubes-dom0-update --check-only</code> -- check for updates<br>
+          <code>qvm-firewall work list</code> -- list firewall rules<br>
+          <code>qvm-usb list</code> -- list USB devices<br>
+          <br>
+          <strong>Timeout:</strong> Maximum seconds before the command is killed (default 300). Increase for long operations like backups or updates.
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="card-title">Command</div>
+        <div class="row">
+          <input type="text" id="exec-cmd" placeholder="e.g. qvm-ls --running --fields NAME,CLASS,LABEL,MEM"
+                 title="Shell command to run in dom0. Press Enter or click Execute."
+                 onkeydown="if(event.key==='Enter')doExec()">
+        </div>
+        <div class="row">
+          <button class="btn-primary" onclick="doExec()" title="Execute the command in dom0">Execute</button>
+          <label style="min-width:auto" title="Maximum seconds before the command is killed">Timeout:</label>
+          <input type="number" id="exec-timeout" value="300" style="width:80px;flex:none"
+                 title="Increase for long operations (backups, updates)">
+          <span style="font-size:12px">sec</span>
+        </div>
+      </div>
+
+      <h3>Output</h3>
+      <div class="dot-inline" id="exec-status"><span class="d ok">&#x25cf;</span> <span>Ready</span></div>
+      <div class="output" id="exec-output" style="min-height:200px"></div>
+    </div>
+
+    <!-- ═══ VMs ═══ -->
+    <div class="page" id="page-vms">
+      <h2 title="Manage which VMs can send commands to dom0">Virtual Machines</h2>
+      <p class="expl">Each VM needs a registered HMAC-SHA256 key to authenticate commands. Only authorized VMs listed here can execute anything in dom0.</p>
+
+      <details>
+        <summary>How to authorize a VM</summary>
+        <div class="doc-content">
+          1. In the VM, run: <code>qvm-remote key gen</code><br>
+          2. Copy the 64-character hex key<br>
+          3. Paste it below with the VM name and click Authorize<br>
+          4. Test: <code>qvm-remote ping</code> from the VM
+        </div>
+      </details>
+
+      <h3 title="VMs with registered keys in /etc/qubes/remote.d/">Authorized VMs</h3>
+      <div class="perm-list" id="vm-list"></div>
+      <div class="row">
+        <button onclick="loadVmKeys()" title="Reload the list of authorized VMs">Refresh</button>
+        <button class="btn-danger" onclick="revokeVm()" title="Remove the selected VM's key">Revoke Selected</button>
+      </div>
+
+      <h3 title="Register a new VM with its HMAC-SHA256 key">Authorize New VM</h3>
+      <div class="card">
+        <div class="row">
+          <label title="The Qubes VM name (e.g. work, personal)">VM name:</label>
+          <input type="text" id="auth-vm" placeholder="vm-name" title="Name of the VM to authorize">
+        </div>
+        <div class="row">
+          <label title="64-character hex key from 'qvm-remote key show'">Key:</label>
+          <input type="text" id="auth-key" placeholder="64-character hex key"
+                 title="Paste the 64-char hex key generated by 'qvm-remote key gen' in the VM">
+          <button class="btn-primary" onclick="authorizeVm()" title="Register this VM+key pair">Authorize</button>
+        </div>
+      </div>
+
+      <h3 title="One-step connection setup: authorize key + add to config + init VM dirs">Connect / Disconnect VM</h3>
+      <details>
+        <summary>How connect/disconnect works</summary>
+        <div class="doc-content">
+          <strong>Connect:</strong> Authorize the VM's key, add it to the config, initialize queue dirs, and signal the daemon.<br>
+          If no key is provided, it auto-fetches from the VM (the VM must be running and have run <code>qvm-remote key gen</code>).<br><br>
+          <strong>Disconnect:</strong> Revokes the key, removes from config, and cleans the VM's queue. The daemon stops polling it.
+        </div>
+      </details>
+      <div class="card">
+        <div class="row">
+          <label title="VM name to connect">VM:</label>
+          <input type="text" id="conn-vm-name" placeholder="vm-name" title="Name of the VM to connect/disconnect">
+          <label title="Optional: hex key (auto-fetched if empty)" style="min-width:auto">Key:</label>
+          <input type="text" id="conn-vm-key" placeholder="(auto-fetch from VM)" title="64-char hex key. Leave empty to auto-fetch from the VM.">
+        </div>
+        <div class="row">
+          <button class="btn-primary" onclick="connectVm()" title="Authorize + add to config + init VM dirs">Connect</button>
+          <button class="btn-danger" onclick="if(confirm('Disconnect this VM? Its key will be revoked and queue cleaned.'))disconnectVm()" title="Revoke key + remove from config + clean queue">Disconnect</button>
+          <button onclick="loadDaemonStatus()" title="Show full daemon status report">Daemon Status</button>
+        </div>
+        <div class="output" id="conn-output" style="max-height:200px;min-height:60px"></div>
+      </div>
+
+      <h3 title="Start, stop, or check VMs from here">VM Lifecycle</h3>
+      <div class="card">
+        <div class="row">
+          <label title="Target VM name">VM:</label>
+          <input type="text" id="lc-vm" value=""" + '"' + MANAGED_VM + '"' + r""" title="Which VM to control">
+          <button class="btn-primary" onclick="vmCtl('start')" title="Start the VM (qvm-start)">Start</button>
+          <button class="btn-danger" onclick="if(confirm('Shutdown this VM?'))vmCtl('stop')" title="Graceful shutdown (qvm-shutdown --wait)">Shutdown</button>
+          <button onclick="vmCtl('check')" title="Check if VM is running">Check</button>
+        </div>
+      </div>
+      <div class="output" id="vm-output" style="min-height:60px"></div>
+    </div>
+
+    <!-- ═══ Files ═══ -->
+    <div class="page" id="page-files">
+      <h2 title="Transfer files between dom0, the managed VM, and other VMs">File Transfers</h2>
+      <p class="expl">Use qvm-run --pass-io to pipe files between VMs through dom0. All transfers are logged.</p>
+
+      <details>
+        <summary>File transfer documentation</summary>
+        <div class="doc-content">
+          <strong>Push (dom0 &rarr; VM):</strong> <code>cat /dom0/file | qvm-run --pass-io VM 'cat &gt; /vm/file'</code><br>
+          <strong>Pull (VM &rarr; dom0):</strong> <code>qvm-run --pass-io VM 'cat /vm/file' &gt; /dom0/file</code><br>
+          <strong>VM-to-VM:</strong> pipes through dom0 using two qvm-run commands<br>
+          <br>
+          Paths must be absolute. Binary files are supported.
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="card-title" title="Copy a file from dom0 into a VM">Push File: Dom0 &rarr; VM</div>
+        <div class="row">
+          <label title="VM to receive the file">Target VM:</label>
+          <input type="text" id="push-vm" value=""" + '"' + MANAGED_VM + '"' + r""" title="Destination VM name">
+        </div>
+        <div class="row">
+          <label title="Path to the file in dom0">Dom0 path:</label>
+          <input type="text" id="push-src" placeholder="/tmp/file" title="Source file in dom0">
+          <label title="Destination path inside the VM" style="min-width:auto">VM path:</label>
+          <input type="text" id="push-dst" placeholder="/tmp/file" title="Where to write in the VM">
+          <button class="btn-primary" onclick="filePush()" title="Send the file">Push</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title" title="Fetch a file from a VM into dom0">Pull File: VM &rarr; Dom0</div>
+        <div class="row">
+          <label title="VM containing the file">Source VM:</label>
+          <input type="text" id="pull-vm" value=""" + '"' + MANAGED_VM + '"' + r""" title="Source VM name">
+          <label title="Path inside the VM" style="min-width:auto">VM path:</label>
+          <input type="text" id="pull-src" placeholder="/path/in/vm" title="File to pull from the VM">
+        </div>
+        <div class="row">
+          <label title="Where to save in dom0">Dom0 dest:</label>
+          <input type="text" id="pull-dst" placeholder="/tmp/" title="Destination in dom0">
+          <button class="btn-primary" onclick="filePull()" title="Fetch the file">Pull</button>
+        </div>
+      </div>
+      <div class="output" id="file-output" style="min-height:60px"></div>
+    </div>
+
+    <!-- ═══ Backup ═══ -->
+    <div class="page" id="page-backup">
+      <h2 title="Create backups of your Qubes system and qvm-remote configuration">Backup &amp; Recovery</h2>
+      <p class="expl">Back up qvm-remote configuration or trigger a full Qubes system backup.</p>
+
+      <details>
+        <summary>Backup documentation</summary>
+        <div class="doc-content">
+          <strong>System backup:</strong> Uses <code>qvm-backup</code> to create an encrypted backup of all VMs.<br>
+          <strong>Config backup:</strong> Archives <code>/etc/qubes/remote.conf</code>, VM keys, and the daemon log.<br>
+          <br>
+          System backups can take hours for large VM sets. Increase the timeout accordingly.
+        </div>
+      </details>
+
+      <h3 title="Trigger a full Qubes OS backup (qvm-backup)">Dom0 System Backup</h3>
+      <div class="card">
+        <div class="row">
+          <label title="Directory or device for the backup">Destination:</label>
+          <input type="text" id="bak-dest" value="/mnt/backup/" title="Path in dom0">
+          <button onclick="checkBackup()" title="List existing backups and check disk space">Check</button>
+          <button class="btn-primary" onclick="if(confirm('Start full Qubes backup? This may take hours.'))startBackup()"
+                  title="Begin a full backup">Start Backup</button>
+        </div>
+      </div>
+      <div class="output" id="bak-output" style="min-height:80px"></div>
+    </div>
+
+    <!-- ═══ Log ═══ -->
+    <div class="page" id="page-log">
+      <h2 title="View the qvm-remote-dom0 daemon log, per-VM logs, and autostart log">Logs</h2>
+      <p class="expl">All logs in one place: daemon command log (per-VM filtering), container logs, and login autostart log.</p>
+
+      <h3 title="qvm-remote-dom0 daemon log — every command, exit code, duration">Daemon Log</h3>
+      <div class="card">
+        <div class="row">
+          <button onclick="loadLog()" title="Reload the full daemon log">All VMs</button>
+          <label style="min-width:auto" title="Filter log to a specific VM">VM filter:</label>
+          <input type="text" id="log-vm" placeholder="(all)" title="Enter a VM name to show only its commands" style="width:120px;flex:none">
+          <button onclick="loadVmLog()" title="Show only commands from this VM">Filter</button>
+          <label style="min-width:auto">Lines:</label>
+          <input type="number" id="log-lines" value="100" style="width:80px;flex:none">
+        </div>
+        <div class="output" id="log-output" style="min-height:250px">Loading...</div>
+      </div>
+
+      <h3 title="Log from the most recent login autostart script">Autostart Log</h3>
+      <div class="card">
+        <button onclick="loadAutoLog()" title="Show the last login setup log">Load</button>
+        <div class="output" id="autolog-output" style="max-height:200px">Click Load to view</div>
+      </div>
+    </div>
+
+    <!-- ═══ Device ═══ -->
+    <div class="page" id="page-device">
+      <h2 title="System information about dom0">This Device</h2>
+      <p class="expl">Hardware and software information about your Qubes system.</p>
+
+      <div class="card">
+        <div class="card-title">Dom0 Information</div>
+        <div class="output" id="dev-info">Loading...</div>
+      </div>
+
+      <h3 title="qvm-ls output showing running VMs">Running VMs</h3>
+      <div class="output" id="dev-vms">Loading...</div>
+      <button onclick="loadDevice()" title="Re-gather system information">Refresh</button>
+    </div>
+
+    <!-- ═══ OpenClaw ═══ -->
+    <div class="page" id="page-openclaw">
+      <h2 title="Manage OpenClaw multi-agent AI containers">OpenClaw</h2>
+      <p class="expl">Manage OpenClaw Cursor proxy and gateway containers. Connect multiple AI agent instances across Qubes VMs.</p>
+
+      <details>
+        <summary>OpenClaw architecture &amp; documentation</summary>
+        <div class="doc-content">
+          <strong>Architecture:</strong><br>
+          &bull; <code>openclaw-cursor proxy</code> (port 32125) -- OpenAI-compatible API proxy<br>
+          &bull; <code>openclaw gateway</code> (port 18789) -- Dashboard + WebSocket for agents<br>
+          &bull; VMs connect via <code>qubes.ConnectTCP</code> (qrexec tunnels, no network routing)<br>
+          <br>
+          <strong>Quick start:</strong><br>
+          1. Start containers: click Start below<br>
+          2. In client VMs: <code>bash client-connect.sh openclaw-vm</code><br>
+          3. Test: <code>curl http://localhost:32125/health</code><br>
+          <br>
+          <strong>Security:</strong> Traffic goes through Xen vchan (not network). Dom0 policy whitelists specific VMs and ports.
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="card-title">Container Status</div>
+        <div class="dot-inline" id="oc-proxy-status">
+          <span class="d warn">&#x25cf;</span> <span>Proxy: checking...</span>
+        </div>
+        <div class="dot-inline" id="oc-gw-status" style="margin-top:4px">
+          <span class="d warn">&#x25cf;</span> <span>Gateway: checking...</span>
+        </div>
+        <div id="oc-containers" style="margin-top:8px;font-size:12px;color:var(--soft)"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Controls</div>
+        <div class="row">
+          <button class="btn-primary" onclick="ocCtl('start')" title="Start OpenClaw containers (docker/podman compose up)">Start</button>
+          <button class="btn-danger" onclick="if(confirm('Stop OpenClaw containers?'))ocCtl('stop')" title="Stop all OpenClaw containers">Stop</button>
+          <button onclick="ocCtl('restart')" title="Restart containers">Restart</button>
+          <button onclick="ocCtl('logs')" title="Show recent container logs">View Logs</button>
+          <button onclick="loadOpenClaw()" title="Refresh status">Refresh</button>
+        </div>
+      </div>
+
+      <h3 title="Control OpenClaw containers running inside a specific VM">VM Container Controls</h3>
+      <details>
+        <summary>How OpenClaw runs in VMs</summary>
+        <div class="doc-content">
+          OpenClaw runs as containers (podman/docker) or systemd user services inside VMs.<br>
+          The proxy listens on <code>:32125</code> (OpenAI-compatible API).<br>
+          The gateway listens on <code>:18789</code> (dashboard + WebSocket).<br>
+          Other VMs connect via <code>qubes.ConnectTCP</code> qrexec tunnels.<br><br>
+          <strong>Container paths searched:</strong> <code>~/qubes-claw/openclaw</code>, <code>~/openclaw-cursor</code>
+        </div>
+      </details>
+      <div class="card">
+        <div class="row">
+          <label title="VM where OpenClaw runs">VM:</label>
+          <input type="text" id="ocvm-name" value=""" + '"' + MANAGED_VM + '"' + r""" title="Target VM name">
+          <button onclick="ocVmCtl('status')" title="Check proxy and gateway health inside the VM">Status</button>
+          <button class="btn-primary" onclick="ocVmCtl('start')" title="Start containers or systemd services in the VM">Start</button>
+          <button class="btn-danger" onclick="if(confirm('Stop OpenClaw in this VM?'))ocVmCtl('stop')" title="Stop all OpenClaw services in the VM">Stop</button>
+          <button onclick="ocVmCtl('logs')" title="Fetch container/service logs from the VM">Logs</button>
+        </div>
+        <div class="output" id="ocvm-output" style="min-height:80px"></div>
+      </div>
+
+      <h3 title="View logs from a specific container (in dom0 or a VM)">Container Logs</h3>
+      <div class="card">
+        <div class="row">
+          <label title="Container name">Container:</label>
+          <input type="text" id="clog-name" placeholder="openclaw-cursor-proxy" title="Container name (e.g. openclaw-cursor-proxy)">
+          <label style="min-width:auto" title="If in a VM, enter name">VM:</label>
+          <input type="text" id="clog-vm" placeholder="(empty=dom0)" title="Leave empty for dom0 containers, or enter VM name">
+          <label style="min-width:auto">Lines:</label>
+          <input type="number" id="clog-lines" value="50" style="width:60px;flex:none">
+          <button class="btn-primary" onclick="getContainerLogs()" title="Fetch logs">Get Logs</button>
+        </div>
+        <div class="output" id="clog-output" style="max-height:250px"></div>
+      </div>
+
+      <h3>ConnectTCP Policy</h3>
+      <div class="info-box">
+        <strong>qubes.ConnectTCP</strong> tunnels TCP connections between VMs through dom0 qrexec — no network routing.<br>
+        Policy file: <code>/etc/qubes/policy.d/50-openclaw.policy</code><br>
+        Use the <strong>Advanced</strong> tab &rarr; <strong>Policies</strong> section to view or edit.
+      </div>
+
+      <div class="output" id="oc-output" style="min-height:100px"></div>
+    </div>
+
+    <!-- ═══ Global Config ═══ -->
+    <div class="page" id="page-globalcfg">
+      <h2 title="Qubes OS global preferences — defaults for VMs, network, kernel, updates">Global Configuration</h2>
+      <p class="expl">System-wide Qubes preferences that apply to all VMs. Changes here affect defaults for new VMs and system behavior.</p>
+
+      <details>
+        <summary>Global preferences documentation</summary>
+        <div class="doc-content">
+          <code>qubes-prefs</code> controls system-wide defaults:<br>
+          <code>default_template</code> — Template used for new AppVMs<br>
+          <code>default_netvm</code> — Default network VM<br>
+          <code>default_dispvm</code> — Default disposable VM template<br>
+          <code>default_kernel</code> — Default kernel for VMs<br>
+          <code>clockvm</code> — VM that provides time to dom0<br>
+          <code>updatevm</code> — VM used for dom0 updates<br>
+          <code>default_pool</code> — Default storage pool<br>
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="card-title">System Preferences</div>
+        <div class="output" id="gp-prefs" style="max-height:250px">Loading...</div>
+        <button onclick="loadGlobalPrefs()" title="Reload global preferences">Refresh</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Edit Preference</div>
+        <div class="row">
+          <label title="Preference name (e.g. default_netvm)">Property:</label>
+          <input type="text" id="gp-prop" placeholder="default_netvm" title="qubes-prefs property name">
+          <label title="New value" style="min-width:auto">Value:</label>
+          <input type="text" id="gp-val" placeholder="sys-firewall" title="New value for the property">
+          <button class="btn-primary" onclick="setGlobalPref()" title="Apply the preference change">Set</button>
+        </div>
+      </div>
+
+      <h3>VM Preferences</h3>
+      <div class="card">
+        <div class="row">
+          <label title="VM name">VM:</label>
+          <input type="text" id="vp-vm" placeholder="work" title="Target VM name">
+          <button onclick="loadVmPrefs()" title="Show all properties for this VM">Show</button>
+        </div>
+        <div class="row">
+          <label title="Property to set">Prop:</label>
+          <input type="text" id="vp-prop" placeholder="memory" title="Property name (e.g. memory, vcpus, netvm)">
+          <label style="min-width:auto">Value:</label>
+          <input type="text" id="vp-val" placeholder="4096" title="New value">
+          <button class="btn-primary" onclick="setVmPref()" title="Set the property value">Set</button>
+        </div>
+        <div class="output" id="vp-output" style="max-height:200px"></div>
+      </div>
+
+      <h3 title="Xen hypervisor information">Xen Hypervisor</h3>
+      <div class="card">
+        <button onclick="loadXen()" title="Load Xen hypervisor details (xl info, xl list, xl uptime)">Load Xen Info</button>
+        <div class="output" id="xen-output" style="max-height:300px"></div>
+      </div>
+
+      <h3 title="Installed template VMs">Templates</h3>
+      <div class="card">
+        <button onclick="loadTemplates()" title="List installed template VMs">List Installed</button>
+        <div class="output" id="tpl-output" style="max-height:200px"></div>
+      </div>
+
+      <h3 title="Check for dom0 updates">Dom0 Updates</h3>
+      <div class="card">
+        <div class="row">
+          <button onclick="dom0Update('check')" title="Check if updates are available (no changes)">Check Updates</button>
+          <button class="btn-danger" onclick="if(confirm('Apply dom0 updates? This may reboot Xen.'))dom0Update('update')" title="Download and install updates">Apply Updates</button>
+        </div>
+        <div class="output" id="upd-output" style="max-height:150px"></div>
+      </div>
+    </div>
+
+    <!-- ═══ Advanced ═══ -->
+    <div class="page" id="page-advanced">
+      <h2 title="Advanced VM management: firewall, devices, features, tags, services, policies">Advanced</h2>
+      <p class="expl">Fine-grained control over VM firewalls, device assignment, qrexec features, tags, services, and dom0 policies.</p>
+
+      <h3 title="Manage VM firewall rules (qvm-firewall)">Firewall</h3>
+      <details>
+        <summary>Firewall documentation</summary>
+        <div class="doc-content">
+          <code>qvm-firewall VM list</code> — Show current rules<br>
+          <code>qvm-firewall VM add accept proto=tcp dstports=443</code> — Allow HTTPS<br>
+          <code>qvm-firewall VM add accept dsthost=10.0.0.0/8</code> — Allow LAN<br>
+          <code>qvm-firewall VM add drop</code> — Block everything (last rule)<br>
+          <code>qvm-firewall VM reset</code> — Reset to default policy<br>
+          Default policy is <strong>drop</strong>. Rules are evaluated top to bottom.
+        </div>
+      </details>
+      <div class="card">
+        <div class="row">
+          <label>VM:</label>
+          <input type="text" id="fw-vm" placeholder="work" title="VM to manage firewall for">
+          <button onclick="loadFirewall()" title="List firewall rules">List Rules</button>
+          <button class="btn-danger" onclick="if(confirm('Reset firewall to defaults?'))resetFirewall()" title="Reset to default rules">Reset</button>
+        </div>
+        <div class="row">
+          <label>Add rule:</label>
+          <input type="text" id="fw-rule" placeholder="accept proto=tcp dstports=443" title="Rule: action [opts] e.g. 'accept dsthost=10.0.0.0/8'">
+          <button class="btn-primary" onclick="addFirewallRule()" title="Add the rule">Add</button>
+        </div>
+        <div class="output" id="fw-output" style="max-height:200px"></div>
+      </div>
+
+      <h3 title="USB, PCI, block, and microphone devices">Devices</h3>
+      <details>
+        <summary>Device documentation</summary>
+        <div class="doc-content">
+          <code>qvm-usb list</code> / <code>qvm-pci list</code> / <code>qvm-block list</code><br>
+          <code>qvm-usb attach VM BACKEND:PORT</code> — Attach USB device to VM<br>
+          <code>qvm-usb detach VM BACKEND:PORT</code> — Detach<br>
+          PCI devices require VM restart. USB devices can be hot-plugged.
+        </div>
+      </details>
+      <div class="card">
+        <div class="row">
+          <button onclick="loadDevices('usb')" title="List USB devices">USB</button>
+          <button onclick="loadDevices('pci')" title="List PCI devices">PCI</button>
+          <button onclick="loadDevices('block')" title="List block devices">Block</button>
+          <button onclick="loadDevices('mic')" title="List microphone devices">Mic</button>
+        </div>
+        <div class="row">
+          <label>VM:</label>
+          <input type="text" id="dev-ctl-vm" placeholder="work" title="VM for attach/detach">
+          <label style="min-width:auto">Port:</label>
+          <input type="text" id="dev-ctl-port" placeholder="sys-usb:2-1" title="Backend:port identifier">
+          <button class="btn-primary" onclick="deviceCtl('attach')" title="Attach device to VM">Attach</button>
+          <button class="btn-danger" onclick="deviceCtl('detach')" title="Detach device from VM">Detach</button>
+        </div>
+        <div class="output" id="dev-ctl-output" style="max-height:200px"></div>
+      </div>
+
+      <h3 title="qvm-features: get/set VM features">Features</h3>
+      <div class="card">
+        <div class="row">
+          <label>VM:</label>
+          <input type="text" id="feat-vm" placeholder="work" title="VM name">
+          <button onclick="loadFeatures()" title="List all features">List</button>
+          <label style="min-width:auto">Feature:</label>
+          <input type="text" id="feat-name" placeholder="gui" title="Feature name">
+          <label style="min-width:auto">Value:</label>
+          <input type="text" id="feat-val" placeholder="1" title="Feature value">
+          <button class="btn-primary" onclick="setFeature()" title="Set feature value">Set</button>
+        </div>
+        <div class="output" id="feat-output" style="max-height:150px"></div>
+      </div>
+
+      <h3 title="qvm-tags: manage VM tags">Tags</h3>
+      <div class="card">
+        <div class="row">
+          <label>VM:</label>
+          <input type="text" id="tag-vm" placeholder="work" title="VM name">
+          <button onclick="loadTags()" title="List tags">List</button>
+          <label style="min-width:auto">Tag:</label>
+          <input type="text" id="tag-name" placeholder="my-tag" title="Tag name">
+          <button class="btn-primary" onclick="modTag('add')" title="Add tag">Add</button>
+          <button class="btn-danger" onclick="modTag('del')" title="Remove tag">Remove</button>
+        </div>
+        <div class="output" id="tag-output" style="max-height:100px"></div>
+      </div>
+
+      <h3 title="qvm-service: manage VM services">Services</h3>
+      <div class="card">
+        <div class="row">
+          <label>VM:</label>
+          <input type="text" id="svc-vm" placeholder="work" title="VM name">
+          <button onclick="loadServices()" title="List services">List</button>
+          <label style="min-width:auto">Service:</label>
+          <input type="text" id="svc-name" placeholder="qubes-update-check" title="Service name">
+          <button class="btn-primary" onclick="modService('enable')" title="Enable service">Enable</button>
+          <button class="btn-danger" onclick="modService('disable')" title="Disable service">Disable</button>
+          <button onclick="modService('default')" title="Reset to default">Default</button>
+        </div>
+        <div class="output" id="svc-output" style="max-height:150px"></div>
+      </div>
+
+      <h3 title="Dom0 qrexec policies in /etc/qubes/policy.d/">Qrexec Policies</h3>
+      <details>
+        <summary>Policy documentation</summary>
+        <div class="doc-content">
+          Policies in <code>/etc/qubes/policy.d/</code> control inter-VM communication.<br>
+          <code>qubes.ConnectTCP</code> — TCP forwarding between VMs<br>
+          <code>qubes.Filecopy</code> — File copy between VMs<br>
+          <code>qubes.ClipboardPaste</code> — Clipboard sharing<br>
+          Files are named <code>NN-name.policy</code> (lower number = higher priority).
+        </div>
+      </details>
+      <div class="card">
+        <div class="row">
+          <button onclick="loadPolicies()" title="List all policy files">List Policy Files</button>
+          <label style="min-width:auto">File:</label>
+          <input type="text" id="pol-name" placeholder="50-openclaw.policy" title="Policy filename">
+          <button onclick="readPolicy()" title="Read the policy file contents">Read</button>
+        </div>
+        <div class="output" id="pol-output" style="max-height:200px"></div>
+      </div>
+    </div>
+
+    <!-- ═══ Policy Enforcer ═══ -->
+    <div class="page" id="page-policy">
+      <h2 title="Restrict which VMs can be modified, protect dom0, and set per-VM permission pools">Policy Enforcer</h2>
+      <p class="expl">
+        Controls which operations the web admin can perform on each VM.
+        <strong>dom0 is excluded from modification by default</strong> &mdash; only reading is allowed.
+        Assign VMs to permission pools like the Qubes 4.3 device attachment panel: selectively grant
+        <em>deny</em>, <em>monitor</em>, <em>manage</em>, or <em>full</em> access per VM.
+      </p>
+
+      <!-- dom0 protection -->
+      <div class="card">
+        <div class="card-title" title="dom0 is the most sensitive domain. By default, no modifications are allowed through the web UI.">dom0 Protection</div>
+        <p style="font-size:12px;color:var(--soft);margin:0 0 8px">
+          dom0 permission controls all direct command execution, service management, backups, and system updates.
+          <strong>deny</strong> (default) blocks all modifications. <strong>monitor</strong> allows read-only views.
+          <strong>manage</strong> allows service control. <strong>full</strong> allows arbitrary command execution.
+        </p>
+        <div class="row" style="align-items:center;gap:10px">
+          <label style="min-width:auto;font-weight:600">dom0 level:</label>
+          <select id="pol-dom0-level" style="width:140px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--fg)" title="Permission level for dom0 operations">
+            <option value="deny">deny (default)</option>
+            <option value="monitor">monitor (read-only)</option>
+            <option value="manage">manage (services + prefs)</option>
+            <option value="full">full (unrestricted)</option>
+          </select>
+          <button class="btn-danger" onclick="setDom0Level()" title="Apply the selected dom0 permission level">Apply</button>
+          <span class="d" id="pol-dom0-dot" title="Current dom0 status">&#x25cf;</span>
+          <span id="pol-dom0-current" style="font-size:12px;color:var(--soft)"></span>
+        </div>
+        <div style="margin-top:8px">
+          <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer" title="When enabled, read-only operations (status, qvm-ls, logs, xen info) work even if dom0 permission is 'deny'. Disable to fully lock out the web UI from dom0.">
+            <input type="checkbox" id="pol-dom0-read" checked> Allow dom0 read even when denied
+          </label>
+          <button style="margin-left:8px" onclick="setDom0Read()" title="Save the dom0 read toggle">Save</button>
+        </div>
+      </div>
+
+      <!-- Default policy -->
+      <div class="card">
+        <div class="card-title" title="Default permission for VMs not explicitly listed below">Default VM Policy</div>
+        <p style="font-size:12px;color:var(--soft);margin:0 0 8px">
+          VMs not in the assignment table below inherit this default permission level.
+          <strong>monitor</strong> (default) allows viewing status, prefs, and logs but blocks modifications.
+        </p>
+        <div class="row" style="align-items:center;gap:10px">
+          <label style="min-width:auto;font-weight:600">Default:</label>
+          <select id="pol-default-level" style="width:140px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--fg)" title="Default permission for unlisted VMs">
+            <option value="deny">deny</option>
+            <option value="monitor">monitor (default)</option>
+            <option value="manage">manage</option>
+            <option value="full">full</option>
+          </select>
+          <button class="btn-primary" onclick="setDefaultLevel()" title="Apply default policy">Apply</button>
+          <span id="pol-default-current" style="font-size:12px;color:var(--soft)"></span>
+        </div>
+      </div>
+
+      <!-- VM assignments (like device attachment panel) -->
+      <div class="card">
+        <div class="card-title" title="Assign per-VM permission levels &#8212; similar to Qubes 4.3 device assignment panel">VM Permission Assignments</div>
+        <p style="font-size:12px;color:var(--soft);margin:0 0 8px">
+          Override the default policy for specific VMs. Select a VM and assign one of four permission levels.
+          This works like the Qubes 4.3 device attachment panel &mdash; each entry is an explicit assignment.
+        </p>
+        <div style="margin-bottom:10px;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px">
+          <table style="width:100%;font-size:13px;border-collapse:collapse" id="pol-vm-table">
+            <thead>
+              <tr style="border-bottom:2px solid var(--border);text-align:left">
+                <th style="padding:4px 8px" title="VM name">VM</th>
+                <th style="padding:4px 8px" title="Assigned permission level">Permission</th>
+                <th style="padding:4px 8px" title="What the level allows">Allows</th>
+                <th style="padding:4px 8px">Action</th>
+              </tr>
+            </thead>
+            <tbody id="pol-vm-tbody"></tbody>
+          </table>
+        </div>
+        <div class="row" style="align-items:center;gap:10px">
+          <label style="min-width:auto;font-weight:600" title="Select a VM to add or update">VM:</label>
+          <select id="pol-add-vm" style="width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--fg)" title="Select VM to assign permissions"></select>
+          <label style="min-width:auto;font-weight:600">Level:</label>
+          <select id="pol-add-level" style="width:140px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--fg)" title="Permission level to assign">
+            <option value="deny">deny</option>
+            <option value="monitor">monitor</option>
+            <option value="manage">manage</option>
+            <option value="full">full</option>
+          </select>
+          <button class="btn-primary" onclick="assignVmPolicy()" title="Add or update the VM permission assignment">Assign</button>
+        </div>
+      </div>
+
+      <!-- Blocked commands -->
+      <div class="card">
+        <div class="card-title" title="Command patterns that are always blocked, regardless of permission level">Blocked Command Patterns</div>
+        <p style="font-size:12px;color:var(--soft);margin:0 0 8px">
+          Commands matching any of these patterns are <strong>always rejected</strong>, even with 'full' permission.
+          One pattern per line. Substring match (e.g., "rm -rf /" blocks any command containing that string).
+        </p>
+        <textarea id="pol-blocked" rows="6" style="width:100%;font-family:monospace;font-size:12px;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);resize:vertical" title="Blocked command patterns, one per line"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button class="btn-primary" onclick="saveBlockedCmds()" title="Save blocked command patterns">Save Blocked Patterns</button>
+        </div>
+      </div>
+
+      <!-- Policy summary & reset -->
+      <div class="card">
+        <div class="card-title" title="Current policy file contents (JSON)">Policy Summary</div>
+        <div class="output" id="pol-summary" style="max-height:250px;font-size:12px"></div>
+        <div class="row" style="margin-top:8px">
+          <button onclick="loadAdminPolicy()" title="Reload and display current policy">Refresh</button>
+          <button class="btn-danger" onclick="if(confirm('Reset policy to defaults? dom0=deny, default=monitor, no VM overrides.'))resetPolicy()" title="Reset all policy settings to safe defaults">Reset to Defaults</button>
+        </div>
+      </div>
+
+      <!-- Permission reference -->
+      <div class="card">
+        <div class="card-title">Permission Level Reference</div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead>
+            <tr style="border-bottom:2px solid var(--border);text-align:left">
+              <th style="padding:4px 8px">Level</th>
+              <th style="padding:4px 8px">Read/Status</th>
+              <th style="padding:4px 8px">Start/Stop</th>
+              <th style="padding:4px 8px">Prefs/Tags/FW</th>
+              <th style="padding:4px 8px">Execute/Files</th>
+              <th style="padding:4px 8px">Devices</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid var(--border)">
+              <td style="padding:4px 8px;font-weight:600;color:#e74c3c">deny</td>
+              <td style="padding:4px 8px">&#x2717;</td><td style="padding:4px 8px">&#x2717;</td>
+              <td style="padding:4px 8px">&#x2717;</td><td style="padding:4px 8px">&#x2717;</td>
+              <td style="padding:4px 8px">&#x2717;</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border)">
+              <td style="padding:4px 8px;font-weight:600;color:#3498db">monitor</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td><td style="padding:4px 8px">&#x2717;</td>
+              <td style="padding:4px 8px">&#x2717;</td><td style="padding:4px 8px">&#x2717;</td>
+              <td style="padding:4px 8px">&#x2717;</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border)">
+              <td style="padding:4px 8px;font-weight:600;color:#f39c12">manage</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td><td style="padding:4px 8px;color:#27ae60">&#x2713;</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td><td style="padding:4px 8px">&#x2717;</td>
+              <td style="padding:4px 8px">&#x2717;</td>
+            </tr>
+            <tr>
+              <td style="padding:4px 8px;font-weight:600;color:#27ae60">full</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td><td style="padding:4px 8px;color:#27ae60">&#x2713;</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td><td style="padding:4px 8px;color:#27ae60">&#x2713;</td>
+              <td style="padding:4px 8px;color:#27ae60">&#x2713;</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API = '';
+let selectedVm = null;
+
+function showPolicyToast(msg) {
+  let toast = document.getElementById('policy-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'policy-toast';
+    toast.style.cssText = 'position:fixed;top:12px;right:12px;z-index:9999;background:#c0392b;color:#fff;padding:12px 20px;border-radius:6px;font-size:13px;font-weight:500;box-shadow:0 4px 12px rgba(0,0,0,0.3);max-width:420px;cursor:pointer;transition:opacity .3s';
+    toast.onclick = () => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); };
+    document.body.appendChild(toast);
+  }
+  toast.style.opacity = '1';
+  toast.innerHTML = '<strong>&#x1f6e1; Policy Denied</strong><br>' + msg.replace(/</g,'&lt;');
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 6000);
+}
+
+// ── Tab navigation ──
+document.querySelectorAll('.sidebar .tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.sidebar .tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('page-' + tab.dataset.page).classList.add('active');
+    const l = typeof tabLoaders !== 'undefined' ? tabLoaders : {
+      dashboard: loadDashboard, execute: ()=>{}, vms: loadVmKeys,
+      files: ()=>{}, backup: ()=>{}, log: loadLog,
+      device: loadDevice, openclaw: loadOpenClaw
+    };
+    (l[tab.dataset.page] || (()=>{}))();
+  });
+});
+
+// ── API helper ──
+async function api(path, params={}, method='GET') {
+  try {
+    let r;
+    if (method === 'POST') {
+      r = await fetch(API + path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(params)
+      });
+    } else {
+      const qs = new URLSearchParams(params).toString();
+      r = await fetch(API + path + (qs ? '?' + qs : ''));
+    }
+    const data = await r.json();
+    if (data.policy_denied) {
+      showPolicyToast(data.err || 'Operation denied by policy');
+    }
+    return data;
+  } catch(e) {
+    return {error: e.message};
+  }
+}
+
+function dot(el, state, text) {
+  el.innerHTML = '<span class="d ' + state + '">&#x25cf;</span> <span>' + esc(text) + '</span>';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ── Connection monitor ──
+async function pollConnection() {
+  const d = await api('/api/status');
+  const bar = document.getElementById('connbar');
+  const dotEl = document.getElementById('conn-dot');
+  const txt = document.getElementById('conn-text');
+  bar.className = 'connbar';
+  if (d.error) {
+    bar.classList.add('err');
+    dotEl.className = 'dot d err';
+    txt.textContent = 'Server not responding';
+  } else if (d.daemon_running && d.vm_running) {
+    bar.classList.add('ok');
+    dotEl.className = 'dot d ok';
+    txt.textContent = 'Connected -- daemon running, ' + d.vm + ' online';
+  } else if (d.daemon_running) {
+    bar.classList.add('warn');
+    dotEl.className = 'dot d warn';
+    txt.textContent = 'Daemon running but ' + d.vm + ' is not running';
+  } else {
+    bar.classList.add('err');
+    dotEl.className = 'dot d err';
+    txt.textContent = 'Daemon stopped -- start it from the Dashboard tab';
+  }
+}
+setInterval(pollConnection, 8000);
+pollConnection();
+
+// ── Dashboard ──
+async function loadDashboard() {
+  const d = await api('/api/status');
+  if (d.error) return;
+  const svc = document.getElementById('svc-status');
+  dot(svc, d.daemon_running ? 'ok' : 'err', d.daemon_running ? 'Running' : 'Stopped');
+  document.getElementById('svc-version').textContent = 'Version: ' + d.daemon_version;
+  dot(document.getElementById('auto-status'),
+      d.daemon_enabled ? 'ok' : 'warn',
+      d.daemon_enabled ? 'Enabled' : 'Disabled');
+  document.getElementById('config-view').textContent = d.config;
+  loadQueueHealth();
+}
+loadDashboard();
+
+async function loadQueueHealth() {
+  const d = await api('/api/queue-health');
+  const el = document.getElementById('queue-status');
+  const det = document.getElementById('queue-detail');
+  if (d.rc === 0 && d.out) {
+    const hasStale = d.out.includes('(not running)') === false;
+    dot(el, 'ok', 'Queue checked');
+    det.textContent = d.out;
+    det.style.display = 'block';
+  } else if (d.err) {
+    dot(el, 'err', 'Queue check failed');
+    det.textContent = d.err;
+    det.style.display = 'block';
+  } else {
+    dot(el, 'warn', 'Could not check');
+  }
+}
+
+async function queueAction(action) {
+  const out = document.getElementById('queue-action-output');
+  out.style.display = 'block';
+  out.textContent = action + 'ing...';
+  const d = await api('/api/queue', {action}, 'POST');
+  out.textContent = (d.out||'') + (d.err||'');
+  loadQueueHealth();
+}
+
+async function connectVm() {
+  const vm = document.getElementById('conn-vm-name').value.trim();
+  const key = document.getElementById('conn-vm-key').value.trim();
+  if (!vm) return alert('Enter a VM name');
+  document.getElementById('conn-output').textContent = 'Connecting ' + vm + '...';
+  const params = {vm};
+  if (key) params.key = key;
+  const d = await api('/api/connect', params, 'POST');
+  document.getElementById('conn-output').textContent = (d.out||'') + (d.err||'');
+  if (d.rc === 0) { loadVmKeys(); pollConnection(); }
+}
+
+async function disconnectVm() {
+  const vm = document.getElementById('conn-vm-name').value.trim();
+  if (!vm) return alert('Enter a VM name');
+  document.getElementById('conn-output').textContent = 'Disconnecting ' + vm + '...';
+  const d = await api('/api/disconnect', {vm}, 'POST');
+  document.getElementById('conn-output').textContent = (d.out||'') + (d.err||'');
+  loadVmKeys(); pollConnection();
+}
+
+async function loadDaemonStatus() {
+  const d = await api('/api/daemon-status');
+  document.getElementById('conn-output').textContent = d.out || d.err || 'No data';
+}
+
+async function svcCtl(action) {
+  const d = await api('/api/service', {action}, 'POST');
+  if (d.error) alert(d.error);
+  if (d.err && d.rc !== 0) alert('Error: ' + d.err);
+  loadDashboard();
+  pollConnection();
+}
+
+// ── Execute (SSE streaming) ──
+let execSource = null;
+function doExec() {
+  const cmd = document.getElementById('exec-cmd').value.trim();
+  if (!cmd) return;
+  const timeout = document.getElementById('exec-timeout').value;
+  dot(document.getElementById('exec-status'), 'warn', 'Running...');
+  const out = document.getElementById('exec-output');
+  out.textContent = '';
+  if (execSource) { execSource.close(); execSource = null; }
+  const qs = new URLSearchParams({cmd, timeout}).toString();
+  execSource = new EventSource('/api/stream/exec?' + qs);
+  execSource.onmessage = function(e) {
+    try {
+      const d = JSON.parse(e.data);
+      if (d.line) { out.textContent += d.line; out.scrollTop = out.scrollHeight; }
+      if (d.done) {
+        execSource.close(); execSource = null;
+        if (d.rc === 0) dot(document.getElementById('exec-status'), 'ok', 'Completed (exit 0)');
+        else if (d.rc === 124) dot(document.getElementById('exec-status'), 'err', 'Timed out');
+        else dot(document.getElementById('exec-status'), 'err', 'Failed (exit ' + d.rc + ')');
+      }
+    } catch(_) {}
+  };
+  execSource.onerror = function() {
+    execSource.close(); execSource = null;
+    dot(document.getElementById('exec-status'), 'err', 'Connection lost');
+  };
+}
+
+// ── VMs ──
+async function loadVmKeys() {
+  const d = await api('/api/vm/keys');
+  const list = document.getElementById('vm-list');
+  list.innerHTML = '';
+  selectedVm = null;
+  if (d.vms && d.vms.length) {
+    d.vms.forEach(v => {
+      const row = document.createElement('div');
+      row.className = 'perm-row';
+      row.textContent = v;
+      row.dataset.vm = v.split(/\s+/)[0];
+      row.onclick = () => {
+        list.querySelectorAll('.perm-row').forEach(r => r.classList.remove('selected'));
+        row.classList.add('selected');
+        selectedVm = row.dataset.vm;
+      };
+      list.appendChild(row);
+    });
+  } else {
+    list.innerHTML = '<div class="perm-row" style="color:var(--misc)">No authorized VMs</div>';
+  }
+}
+
+async function authorizeVm() {
+  const vm = document.getElementById('auth-vm').value.trim();
+  const key = document.getElementById('auth-key').value.trim();
+  if (!vm || !key) return alert('Enter both VM name and key');
+  const d = await api('/api/vm/authorize', {vm, key}, 'POST');
+  document.getElementById('vm-output').textContent = (d.out||'') + (d.err||'');
+  if (d.rc === 0) { document.getElementById('auth-vm').value = ''; document.getElementById('auth-key').value = ''; loadVmKeys(); }
+}
+
+async function revokeVm() {
+  if (!selectedVm) return alert('Select a VM first');
+  if (!confirm('Revoke ' + selectedVm + '? It will no longer be able to run commands.')) return;
+  const d = await api('/api/vm/revoke', {vm: selectedVm}, 'POST');
+  document.getElementById('vm-output').textContent = (d.out||'') + (d.err||'');
+  loadVmKeys();
+}
+
+async function vmCtl(action) {
+  const vm = document.getElementById('lc-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/vm/control', {vm, action}, 'POST');
+  if (d.running !== undefined) {
+    document.getElementById('vm-output').textContent = vm + ' is ' + (d.running ? 'running' : 'NOT running');
+  } else {
+    document.getElementById('vm-output').textContent = (d.out||'') + (d.err||'');
+  }
+}
+
+// ── Files ──
+async function filePush() {
+  const vm = document.getElementById('push-vm').value.trim();
+  const src = document.getElementById('push-src').value.trim();
+  const dst = document.getElementById('push-dst').value.trim();
+  if (!vm || !src || !dst) return alert('Fill in all fields');
+  document.getElementById('file-output').textContent = 'Pushing...';
+  const d = await api('/api/file/push', {vm, src, dst}, 'POST');
+  document.getElementById('file-output').textContent = (d.out||'') + (d.err||'') || 'Done (exit ' + d.rc + ')';
+}
+
+async function filePull() {
+  const vm = document.getElementById('pull-vm').value.trim();
+  const src = document.getElementById('pull-src').value.trim();
+  const dst = document.getElementById('pull-dst').value.trim();
+  if (!vm || !src || !dst) return alert('Fill in all fields');
+  document.getElementById('file-output').textContent = 'Pulling...';
+  const d = await api('/api/file/pull', {vm, src, dst}, 'POST');
+  document.getElementById('file-output').textContent = (d.out||'') + (d.err||'') || 'Done (exit ' + d.rc + ')';
+}
+
+// ── Backup ──
+async function checkBackup() {
+  const d = await api('/api/backup/status');
+  document.getElementById('bak-output').textContent = d.out || 'No output';
+}
+
+async function startBackup() {
+  const dest = document.getElementById('bak-dest').value.trim();
+  document.getElementById('bak-output').textContent = 'Starting backup to ' + dest + '...\nThis may take a very long time.';
+  const d = await api('/api/backup/start', {dest}, 'POST');
+  document.getElementById('bak-output').textContent = (d.out||'') + (d.err||'');
+}
+
+// ── Log ──
+async function loadLog() {
+  const lines = document.getElementById('log-lines').value;
+  const d = await api('/api/log', {lines});
+  document.getElementById('log-output').textContent = d.log || 'No log data';
+}
+
+// ── Device ──
+async function loadDevice() {
+  const d = await api('/api/device');
+  document.getElementById('dev-info').textContent = d.info || 'No data';
+  document.getElementById('dev-vms').textContent = d.vms || 'No data';
+}
+
+// ── OpenClaw ──
+async function loadOpenClaw() {
+  const d = await api('/api/openclaw/status');
+  const ps = document.getElementById('oc-proxy-status');
+  const gs = document.getElementById('oc-gw-status');
+  dot(ps, d.proxy_healthy ? 'ok' : 'err', 'Proxy: ' + (d.proxy_healthy ? 'healthy' : 'not responding'));
+  dot(gs, d.gateway_healthy ? 'ok' : 'err', 'Gateway: ' + (d.gateway_healthy ? 'healthy' : 'not responding'));
+  const ct = document.getElementById('oc-containers');
+  if (d.containers && d.containers.length) {
+    ct.innerHTML = d.containers.map(c =>
+      '<div>' + esc(c.name) + ' -- ' + esc(c.status) + ' -- ' + esc(c.ports) + '</div>'
+    ).join('');
+    ct.innerHTML += '<div style="margin-top:4px">Engine: ' + esc(d.engine) + '</div>';
+  } else {
+    ct.textContent = 'No OpenClaw containers found. Use Start to launch them.';
+  }
+}
+
+async function ocCtl(action) {
+  document.getElementById('oc-output').textContent = action + 'ing...';
+  const d = await api('/api/openclaw/control', {action}, 'POST');
+  document.getElementById('oc-output').textContent = (d.out||'') + (d.err||'');
+  if (action !== 'logs') setTimeout(loadOpenClaw, 2000);
+}
+
+// ── Global Config ──
+async function loadGlobalPrefs() {
+  const d = await api('/api/qubes-prefs');
+  document.getElementById('gp-prefs').textContent = d.out || d.error || 'No data';
+}
+
+async function setGlobalPref() {
+  const prop = document.getElementById('gp-prop').value.trim();
+  const val = document.getElementById('gp-val').value.trim();
+  if (!prop || !val) return alert('Enter property and value');
+  if (!confirm('Set global ' + prop + ' = ' + val + '?')) return;
+  const d = await api('/api/qubes-prefs', {prop, val}, 'POST');
+  if (d.rc === 0) { alert('Set OK'); loadGlobalPrefs(); }
+  else alert('Error: ' + (d.err || d.error));
+}
+
+async function loadVmPrefs() {
+  const vm = document.getElementById('vp-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/vm/prefs', {vm});
+  document.getElementById('vp-output').textContent = d.out || d.error || 'No data';
+}
+
+async function setVmPref() {
+  const vm = document.getElementById('vp-vm').value.trim();
+  const prop = document.getElementById('vp-prop').value.trim();
+  const val = document.getElementById('vp-val').value.trim();
+  if (!vm || !prop || !val) return alert('Fill in VM, property, and value');
+  const d = await api('/api/vm/prefs', {vm, prop, val}, 'POST');
+  if (d.rc === 0) { alert('Set OK'); loadVmPrefs(); }
+  else alert('Error: ' + (d.err || d.error));
+}
+
+async function loadXen() {
+  const d = await api('/api/xen');
+  document.getElementById('xen-output').textContent =
+    '=== xl info ===\n' + (d.info||'') + '\n=== xl list ===\n' + (d.list||'') + '\n=== xl uptime ===\n' + (d.uptime||'');
+}
+
+async function loadTemplates() {
+  const d = await api('/api/templates');
+  document.getElementById('tpl-output').textContent = d.out || 'No data';
+}
+
+async function dom0Update(action) {
+  document.getElementById('upd-output').textContent = action === 'check' ? 'Checking...' : 'Updating (this may take a while)...';
+  const d = await api('/api/dom0-update', {action}, 'POST');
+  document.getElementById('upd-output').textContent = (d.out||'') + (d.err||'');
+}
+
+// ── Advanced ──
+async function loadFirewall() {
+  const vm = document.getElementById('fw-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/firewall', {vm, action: 'list'});
+  document.getElementById('fw-output').textContent = (d.out||'') + (d.err||'');
+}
+
+async function resetFirewall() {
+  const vm = document.getElementById('fw-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/firewall', {vm, action: 'reset'}, 'POST');
+  document.getElementById('fw-output').textContent = (d.out||'') + (d.err||'');
+  loadFirewall();
+}
+
+async function addFirewallRule() {
+  const vm = document.getElementById('fw-vm').value.trim();
+  const rule = document.getElementById('fw-rule').value.trim();
+  if (!vm || !rule) return alert('Enter VM and rule');
+  const d = await api('/api/firewall', {vm, action: 'add', rule}, 'POST');
+  document.getElementById('fw-output').textContent = (d.out||'') + (d.err||'');
+  if (d.rc === 0) loadFirewall();
+}
+
+async function loadDevices(type) {
+  const d = await api('/api/devices', {type});
+  document.getElementById('dev-ctl-output').textContent = (d.out||'') + (d.error||'');
+}
+
+async function deviceCtl(action) {
+  const vm = document.getElementById('dev-ctl-vm').value.trim();
+  const port = document.getElementById('dev-ctl-port').value.trim();
+  if (!vm || !port) return alert('Enter VM and port');
+  const d = await api('/api/devices/ctl', {vm, port, action, type: 'usb'}, 'POST');
+  document.getElementById('dev-ctl-output').textContent = (d.out||'') + (d.err||d.error||'');
+}
+
+async function loadFeatures() {
+  const vm = document.getElementById('feat-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/features', {vm});
+  document.getElementById('feat-output').textContent = (d.out||'') + (d.error||'');
+}
+
+async function setFeature() {
+  const vm = document.getElementById('feat-vm').value.trim();
+  const feature = document.getElementById('feat-name').value.trim();
+  const value = document.getElementById('feat-val').value.trim();
+  if (!vm || !feature || !value) return alert('Fill in all fields');
+  const d = await api('/api/features', {vm, feature, value}, 'POST');
+  if (d.rc === 0) loadFeatures();
+  else alert('Error: ' + (d.err||d.error));
+}
+
+async function loadTags() {
+  const vm = document.getElementById('tag-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/tags', {vm, action: 'list'});
+  document.getElementById('tag-output').textContent = (d.out||'') + (d.error||'');
+}
+
+async function modTag(action) {
+  const vm = document.getElementById('tag-vm').value.trim();
+  const tag = document.getElementById('tag-name').value.trim();
+  if (!vm || !tag) return alert('Enter VM and tag');
+  await api('/api/tags', {vm, action, tag}, 'POST');
+  loadTags();
+}
+
+async function loadServices() {
+  const vm = document.getElementById('svc-vm').value.trim();
+  if (!vm) return;
+  const d = await api('/api/services', {vm, action: 'list'});
+  document.getElementById('svc-output').textContent = (d.out||'') + (d.error||'');
+}
+
+async function modService(action) {
+  const vm = document.getElementById('svc-vm').value.trim();
+  const service = document.getElementById('svc-name').value.trim();
+  if (!vm || !service) return alert('Enter VM and service');
+  await api('/api/services', {vm, action, service}, 'POST');
+  loadServices();
+}
+
+async function loadPolicies() {
+  const d = await api('/api/policy', {action: 'list'});
+  document.getElementById('pol-output').textContent = d.out || 'No policies found';
+}
+
+async function readPolicy() {
+  const name = document.getElementById('pol-name').value.trim();
+  if (!name) return;
+  const d = await api('/api/policy', {action: 'read', name});
+  document.getElementById('pol-output').textContent = d.out || d.error || 'Not found';
+}
+
+// ── OpenClaw VM controls ──
+async function ocVmCtl(action) {
+  const vm = document.getElementById('ocvm-name').value.trim();
+  if (!vm) return;
+  document.getElementById('ocvm-output').textContent = action + 'ing in ' + vm + '...';
+  const d = await api('/api/openclaw/vm', {vm, action}, 'POST');
+  document.getElementById('ocvm-output').textContent = (d.out||'') + (d.err||'');
+}
+
+async function getContainerLogs() {
+  const container = document.getElementById('clog-name').value.trim();
+  const vm = document.getElementById('clog-vm').value.trim();
+  const lines = document.getElementById('clog-lines').value;
+  if (!container) return alert('Enter container name');
+  const d = await api('/api/container/logs', {container, vm, lines}, 'POST');
+  document.getElementById('clog-output').textContent = (d.out||'') + (d.err||d.error||'');
+}
+
+// ── Per-VM log ──
+async function loadVmLog() {
+  const vm = document.getElementById('log-vm').value.trim();
+  const lines = document.getElementById('log-lines').value;
+  const d = await api('/api/vm-log', {vm, lines});
+  document.getElementById('log-output').textContent = d.log || 'No entries for this VM';
+}
+
+async function loadAutoLog() {
+  const d = await api('/api/autostart-log');
+  document.getElementById('autolog-output').textContent = d.log || 'No autostart log found';
+}
+
+// ── Policy Enforcer ──
+const PERM_COLORS = {deny:'#e74c3c',monitor:'#3498db',manage:'#f39c12',full:'#27ae60'};
+const PERM_DESC = {
+  deny: 'All operations blocked',
+  monitor: 'Read-only: status, list, logs, check',
+  manage: 'Start/stop, prefs, features, tags, services, firewall',
+  full: 'All operations including execute, files, device attach'
+};
+
+async function loadAdminPolicy() {
+  const d = await api('/api/admin-policy', {action:'get'});
+  if (d.error) { alert(d.error); return; }
+  const p = d.policy;
+  const vms = d.available_vms || [];
+  document.getElementById('pol-dom0-level').value = p.dom0 || 'deny';
+  const dot = document.getElementById('pol-dom0-dot');
+  dot.style.color = PERM_COLORS[p.dom0] || PERM_COLORS.deny;
+  document.getElementById('pol-dom0-current').textContent = 'Current: ' + (p.dom0||'deny');
+  document.getElementById('pol-dom0-read').checked = p.dom0_read_allowed !== false;
+  document.getElementById('pol-default-level').value = p.default || 'monitor';
+  document.getElementById('pol-default-current').textContent = 'Current: ' + (p.default||'monitor');
+  document.getElementById('pol-blocked').value = (p.blocked_commands||[]).join('\n');
+  const tbody = document.getElementById('pol-vm-tbody');
+  tbody.innerHTML = '';
+  const assigned = p.vms || {};
+  for (const [vm, level] of Object.entries(assigned).sort()) {
+    const tr = document.createElement('tr');
+    tr.style.borderBottom = '1px solid var(--border)';
+    tr.innerHTML = '<td style="padding:4px 8px;font-weight:500">' + esc(vm) + '</td>' +
+      '<td style="padding:4px 8px"><span style="color:' + (PERM_COLORS[level]||'inherit') +
+      ';font-weight:600">' + esc(level) + '</span></td>' +
+      '<td style="padding:4px 8px;font-size:11px;color:var(--soft)">' + (PERM_DESC[level]||'') + '</td>' +
+      '<td style="padding:4px 8px"><button class="btn-danger" style="font-size:11px;padding:2px 8px" ' +
+      'onclick="removeVmPolicy(\'' + esc(vm) + '\')" title="Remove this assignment (VM falls back to default)">Remove</button></td>';
+    tbody.appendChild(tr);
+  }
+  if (!Object.keys(assigned).length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td colspan="4" style="padding:8px;text-align:center;color:var(--soft);font-style:italic">No VM-specific assignments. All VMs use the default policy.</td>';
+    tbody.appendChild(tr);
+  }
+  const sel = document.getElementById('pol-add-vm');
+  sel.innerHTML = '';
+  for (const vm of vms) {
+    if (vm === 'dom0') continue;
+    const opt = document.createElement('option');
+    opt.value = vm; opt.textContent = vm;
+    if (assigned[vm]) opt.textContent += ' (' + assigned[vm] + ')';
+    sel.appendChild(opt);
+  }
+  document.getElementById('pol-summary').textContent = JSON.stringify(p, null, 2);
+}
+
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+async function setDom0Level() {
+  const level = document.getElementById('pol-dom0-level').value;
+  if (level !== 'deny' && !confirm('Warning: Changing dom0 from "deny" allows web UI to modify dom0.\\nSet dom0 to "' + level + '"?')) return;
+  const d = await api('/api/admin-policy', {action:'set_dom0', level}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+async function setDom0Read() {
+  const val = document.getElementById('pol-dom0-read').checked ? 'true' : 'false';
+  const d = await api('/api/admin-policy', {action:'set_dom0_read', value:val}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+async function setDefaultLevel() {
+  const level = document.getElementById('pol-default-level').value;
+  const d = await api('/api/admin-policy', {action:'set_default', level}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+async function assignVmPolicy() {
+  const vm = document.getElementById('pol-add-vm').value;
+  const level = document.getElementById('pol-add-level').value;
+  if (!vm) return alert('Select a VM');
+  const d = await api('/api/admin-policy', {action:'set_vm', vm, level}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+async function removeVmPolicy(vm) {
+  if (!confirm('Remove assignment for "' + vm + '"? It will fall back to the default policy.')) return;
+  const d = await api('/api/admin-policy', {action:'remove_vm', vm}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+async function saveBlockedCmds() {
+  const commands = document.getElementById('pol-blocked').value;
+  const d = await api('/api/admin-policy', {action:'set_blocked', commands}, 'POST');
+  if (d.error) alert(d.error);
+  else alert('Blocked patterns saved');
+  loadAdminPolicy();
+}
+
+async function resetPolicy() {
+  const d = await api('/api/admin-policy', {action:'reset'}, 'POST');
+  if (d.error) alert(d.error);
+  loadAdminPolicy();
+}
+
+// ── Tab loader map update ──
+const tabLoaders = {
+  dashboard: loadDashboard, execute: ()=>{}, vms: loadVmKeys,
+  files: ()=>{}, backup: ()=>{}, log: loadLog,
+  device: loadDevice, openclaw: loadOpenClaw,
+  globalcfg: loadGlobalPrefs, advanced: ()=>{},
+  policy: loadAdminPolicy
+};
+
+// ── Keyboard shortcuts ──
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key === 'Enter') doExec();
+});
+</script>
+</body>
+</html>"""
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("qubes-global-admin-web -- Air-gapped web admin for Qubes OS")
+        print()
+        print("Usage: qubes-global-admin-web [--port PORT]")
+        print()
+        print("Serves on http://127.0.0.1:{} (localhost only)".format(PORT))
+        print("Open in Firefox or Chrome in dom0.")
+        print()
+        print("Environment: QUBES_ADMIN_PORT (default: 9876)")
+        sys.exit(0)
+
+    port = PORT
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--port" and i + 2 < len(sys.argv):
+            port = int(sys.argv[i + 2])
+
+    server = ThreadedServer((HOST, port), Handler)
+    url = "http://{}:{}".format(HOST, port)
+    print("Qubes Global Admin Web v{}".format(VERSION))
+    print("Serving on {}".format(url))
+    print("Open in your browser (dom0, air-gapped, no internet required)")
+    print("Press Ctrl+C to stop")
+
+    # Try to open browser automatically
+    try:
+        subprocess.Popen(["xdg-open", url],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+    signal.signal(signal.SIGINT, lambda *_: (server.shutdown(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *_: (server.shutdown(), sys.exit(0)))
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    server.server_close()
+    print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()

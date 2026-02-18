@@ -25,3 +25,5 @@ __pycache__/
 # GPG private keys (public .asc keys ARE tracked)
 keys/*.gpg
 keys/*.key
+*.pyc
+__pycache__/

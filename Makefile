@@ -14,7 +14,9 @@ GPG_NAME  ?= qvm-remote
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || echo docker)
 
 .PHONY: help install-vm install-dom0 install-gui-vm install-gui-dom0 \
+        install-admin-vm install-admin-dom0 install-web \
         uninstall-vm uninstall-dom0 uninstall-gui-vm uninstall-gui-dom0 \
+        uninstall-admin-vm uninstall-admin-dom0 uninstall-web \
         check test clean dist rpm rpm-sign docker-rpm docker-test dom0-test \
         arch-test gui-test gui-integration-test backup-e2e-test all-test deb
 
@@ -30,6 +32,8 @@ help:
 	@echo "  uninstall-dom0     Remove dom0-side daemon"
 	@echo "  uninstall-gui-vm   Remove VM-side GUI"
 	@echo "  uninstall-gui-dom0 Remove dom0-side GUI"
+	@echo "  install-web        Install web admin UI (dom0, localhost:9876)"
+	@echo "  uninstall-web      Remove web admin UI"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  dist            Create source tarballs in build/SOURCES/"
@@ -98,12 +102,57 @@ uninstall-gui-dom0:
 	rm -f $(DESTDIR)$(LIBDIR)/qubes_remote_ui.py
 	rm -f $(DESTDIR)$(DATADIR)/applications/qvm-remote-dom0-gui.desktop
 
+install-admin-vm:
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 gui2/qubes-global-admin $(DESTDIR)$(BINDIR)/qubes-global-admin
+	install -d $(DESTDIR)$(LIBDIR)
+	install -m 0644 gui2/qubes_admin_ui.py $(DESTDIR)$(LIBDIR)/qubes_admin_ui.py
+	install -m 0644 version $(DESTDIR)$(LIBDIR)/version
+	install -d $(DESTDIR)$(DATADIR)/applications
+	install -m 0644 gui2/qubes-global-admin.desktop $(DESTDIR)$(DATADIR)/applications/qubes-global-admin.desktop
+
+install-admin-dom0:
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 gui2/qubes-global-admin-dom0 $(DESTDIR)$(BINDIR)/qubes-global-admin-dom0
+	install -d $(DESTDIR)$(LIBDIR)
+	install -m 0644 gui2/qubes_admin_ui.py $(DESTDIR)$(LIBDIR)/qubes_admin_ui.py
+	install -m 0644 version $(DESTDIR)$(LIBDIR)/version
+	install -d $(DESTDIR)$(DATADIR)/applications
+	install -m 0644 gui2/qubes-global-admin-dom0.desktop $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-dom0.desktop
+
+uninstall-admin-vm:
+	rm -f $(DESTDIR)$(BINDIR)/qubes-global-admin
+	rm -f $(DESTDIR)$(LIBDIR)/qubes_admin_ui.py
+	rm -f $(DESTDIR)$(DATADIR)/applications/qubes-global-admin.desktop
+
+uninstall-admin-dom0:
+	rm -f $(DESTDIR)$(BINDIR)/qubes-global-admin-dom0
+	rm -f $(DESTDIR)$(LIBDIR)/qubes_admin_ui.py
+	rm -f $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-dom0.desktop
+
+install-web:
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 webui/qubes-global-admin-web $(DESTDIR)$(BINDIR)/qubes-global-admin-web
+	install -d $(DESTDIR)$(UNITDIR)
+	install -m 0644 webui/qubes-global-admin-web.service $(DESTDIR)$(UNITDIR)/qubes-global-admin-web.service
+	install -d $(DESTDIR)$(DATADIR)/applications
+	install -m 0644 webui/qubes-global-admin-web.desktop $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-web.desktop
+
+uninstall-web:
+	rm -f $(DESTDIR)$(BINDIR)/qubes-global-admin-web
+	rm -f $(DESTDIR)$(UNITDIR)/qubes-global-admin-web.service
+	rm -f $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-web.desktop
+
 check:
 	@python3 -c "import py_compile; py_compile.compile('vm/qvm-remote', doraise=True)" && echo "vm/qvm-remote: ok"
 	@python3 -c "import py_compile; py_compile.compile('dom0/qvm-remote-dom0', doraise=True)" && echo "dom0/qvm-remote-dom0: ok"
 	@python3 -c "import py_compile; py_compile.compile('gui/qubes_remote_ui.py', doraise=True)" && echo "gui/qubes_remote_ui.py: ok"
 	@python3 -c "import py_compile; py_compile.compile('gui/qvm-remote-gui', doraise=True)" && echo "gui/qvm-remote-gui: ok"
 	@python3 -c "import py_compile; py_compile.compile('gui/qvm-remote-dom0-gui', doraise=True)" && echo "gui/qvm-remote-dom0-gui: ok"
+	@python3 -c "import py_compile; py_compile.compile('gui2/qubes_admin_ui.py', doraise=True)" && echo "gui2/qubes_admin_ui.py: ok"
+	@python3 -c "import py_compile; py_compile.compile('gui2/qubes-global-admin', doraise=True)" && echo "gui2/qubes-global-admin: ok"
+	@python3 -c "import py_compile; py_compile.compile('gui2/qubes-global-admin-dom0', doraise=True)" && echo "gui2/qubes-global-admin-dom0: ok"
+	@python3 -c "import py_compile; py_compile.compile('webui/qubes-global-admin-web', doraise=True)" && echo "webui/qubes-global-admin-web: ok"
 	@bash -n install/install-dom0.sh && echo "install/install-dom0.sh: ok"
 	@bash -n upgrade-dom0.sh && echo "upgrade-dom0.sh: ok"
 

@@ -51,6 +51,10 @@ subcommands:
   key show             print current key
   key import [KEY]     import a hex key (or stdin)
   ping                 check dom0 executor status
+  status               connection status + queue health
+  queue status         show queue counts (pending/running/results)
+  queue clean          remove stale entries from all queues
+  queue debug          detailed queue dump for troubleshooting
   log [N]              show last N audit entries (default: 20)
   history [N]          show last N commands (default: 10)
 
@@ -148,6 +152,31 @@ def migrate_data_dir() -> None:
     if old.exists() and not DATA_DIR.exists():
         try:
             old.rename(DATA_DIR)
+        except OSError:
+            pass
+
+
+STALE_AGE = 3600  # 1 hour
+
+
+def cleanup_stale_queue() -> None:
+    """Remove stale entries from all queue dirs (uncollected results, orphans).
+
+    Called once at client startup. A result or pending file older than
+    STALE_AGE seconds is considered abandoned and safe to remove.
+    """
+    now = time.time()
+    for subdir in ("pending", "running", "results"):
+        d = QUEUE_DIR / subdir
+        if not d.exists():
+            continue
+        try:
+            for f in d.iterdir():
+                try:
+                    if now - f.stat().st_mtime > STALE_AGE:
+                        f.unlink(missing_ok=True)
+                except OSError:
+                    pass
         except OSError:
             pass
 
@@ -277,6 +306,152 @@ def cmd_history(args: list[str]) -> int:
     return 0
 
 
+# ── queue management ─────────────────────────────────────────────────
+
+def _queue_counts() -> dict[str, int]:
+    """Count files in each queue subdirectory."""
+    counts: dict[str, int] = {}
+    for subdir in ("pending", "running", "results"):
+        d = QUEUE_DIR / subdir
+        if d.exists():
+            entries = [f for f in d.iterdir()
+                       if not f.name.endswith((".auth", ".cmd"))]
+            counts[subdir] = len(entries)
+        else:
+            counts[subdir] = 0
+    orphans = 0
+    pending_dir = QUEUE_DIR / "pending"
+    if pending_dir.exists():
+        main_ids = {f.name for f in pending_dir.iterdir()
+                    if not f.name.endswith((".auth", ".cmd"))}
+        for f in pending_dir.iterdir():
+            if f.name.endswith(".auth"):
+                base = f.name[:-5]
+                if base not in main_ids:
+                    orphans += 1
+    counts["orphan_auth"] = orphans
+    return counts
+
+
+def cmd_status() -> int:
+    """Full connection status: key, queue health, daemon reachability."""
+    hostname = os.uname().nodename or "unknown"
+    print(f"VM:        {hostname}")
+    print(f"Data dir:  {DATA_DIR}")
+    if KEY_FILE.exists():
+        key = KEY_FILE.read_text().strip()
+        print(f"Auth key:  {key[:16]}... (configured)")
+    else:
+        print("Auth key:  NOT CONFIGURED")
+        print(f"  hint: run '{PROGNAME} key gen' to create one")
+
+    init_dirs()
+    c = _queue_counts()
+    healthy = c["running"] == 0 and c["orphan_auth"] == 0
+    state = "clean" if healthy else "STALE ENTRIES"
+    print(f"\nQueue:     {state}")
+    print(f"  pending:      {c['pending']}")
+    print(f"  running:      {c['running']}")
+    print(f"  results:      {c['results']}")
+    print(f"  orphan .auth: {c['orphan_auth']}")
+
+    if not healthy:
+        print(f"\n  hint: run '{PROGNAME} queue clean' to remove stale entries")
+
+    print("\nDaemon:    ", end="", flush=True)
+    cid = f"ping-{int(time.time() * 1e9)}-{os.getpid()}"
+    (QUEUE_DIR / "pending" / cid).write_text("true\n")
+    write_auth_token(cid)
+    t0 = time.time()
+    responding = False
+    while time.time() - t0 < 5:
+        if (QUEUE_DIR / "results" / f"{cid}.exit").exists():
+            responding = True
+            for ext in ("out", "err", "exit", "meta"):
+                (QUEUE_DIR / "results" / f"{cid}.{ext}").unlink(
+                    missing_ok=True
+                )
+            break
+        time.sleep(0.3)
+    if not responding:
+        for p in (QUEUE_DIR / "pending" / cid,
+                  QUEUE_DIR / "pending" / f"{cid}.auth"):
+            p.unlink(missing_ok=True)
+    print("responding" if responding else "NOT responding")
+    return 0 if (responding and healthy) else 1
+
+
+def cmd_queue_status() -> int:
+    init_dirs()
+    c = _queue_counts()
+    print(f"{'Queue':<14} {'Count':>6}")
+    print(f"{'─'*14} {'─'*6}")
+    print(f"{'pending':<14} {c['pending']:>6}")
+    print(f"{'running':<14} {c['running']:>6}")
+    print(f"{'results':<14} {c['results']:>6}")
+    print(f"{'orphan .auth':<14} {c['orphan_auth']:>6}")
+    total = c["pending"] + c["running"] + c["results"]
+    print(f"{'─'*14} {'─'*6}")
+    print(f"{'total':<14} {total:>6}")
+    if c["running"] > 0:
+        print(f"\nWARNING: {c['running']} commands stuck in running/")
+        print(f"  These are from a prior daemon crash. Clean with:")
+        print(f"  {PROGNAME} queue clean")
+    if c["orphan_auth"] > 0:
+        print(f"\nWARNING: {c['orphan_auth']} orphan .auth files in pending/")
+    return 0
+
+
+def cmd_queue_clean() -> int:
+    init_dirs()
+    removed = 0
+    for subdir in ("pending", "running", "results"):
+        d = QUEUE_DIR / subdir
+        if not d.exists():
+            continue
+        for f in d.iterdir():
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    print(f"Cleaned {removed} file(s) from queue.")
+    audit(f"QUEUE-CLEAN removed={removed}")
+    return 0
+
+
+def cmd_queue_debug() -> int:
+    """Detailed dump of every file in every queue directory."""
+    init_dirs()
+    now = time.time()
+    for subdir in ("pending", "running", "results"):
+        d = QUEUE_DIR / subdir
+        entries = sorted(d.iterdir()) if d.exists() else []
+        print(f"\n── {subdir}/ ({len(entries)} files) ──")
+        if not entries:
+            print("  (empty)")
+            continue
+        for f in entries:
+            try:
+                st = f.stat()
+                age = int(now - st.st_mtime)
+                size = st.st_size
+                preview = ""
+                if size < 500 and size > 0:
+                    preview = f"  content={f.read_text()[:80].strip()!r}"
+                print(f"  {f.name:<40} {size:>8}B  age={age}s{preview}")
+            except OSError as e:
+                print(f"  {f.name:<40} ERROR: {e}")
+
+    hist_dirs = sorted(HISTORY_DIR.glob("*/*"), reverse=True)[:5] if HISTORY_DIR.exists() else []
+    print(f"\n── history/ (last 5 of {len(list(HISTORY_DIR.glob('*/*'))) if HISTORY_DIR.exists() else 0}) ──")
+    for d in hist_dirs:
+        rc_file = d / "exit"
+        rc = rc_file.read_text().strip() if rc_file.exists() else "?"
+        print(f"  {d.parent.name}/{d.name}  exit={rc}")
+    return 0
+
+
 # ── command execution ────────────────────────────────────────────────
 
 def cmd_exec(
@@ -324,6 +499,7 @@ def cmd_exec(
                 cmd_file,
                 cmd_copy,
                 QUEUE_DIR / "pending" / f"{cid}.auth",
+                QUEUE_DIR / "pending" / f"{cid}.cmd",
                 QUEUE_DIR / "running" / cid,
             ):
                 p.unlink(missing_ok=True)
@@ -359,6 +535,7 @@ def cmd_exec(
 
 def main() -> int:
     migrate_data_dir()
+    cleanup_stale_queue()
 
     timeout = DEFAULT_TIMEOUT
     verbose = False
@@ -419,6 +596,19 @@ def main() -> int:
         die(f"unknown key command: {act}")
     if sub == "ping":
         return cmd_ping()
+    if sub == "status":
+        return cmd_status()
+    if sub == "queue":
+        if len(rest) < 2:
+            return cmd_queue_status()
+        act = rest[1]
+        if act == "status":
+            return cmd_queue_status()
+        if act == "clean":
+            return cmd_queue_clean()
+        if act == "debug":
+            return cmd_queue_debug()
+        die(f"unknown queue command: {act}")
     if sub == "log":
         return cmd_log(rest[1:])
     if sub == "history":
