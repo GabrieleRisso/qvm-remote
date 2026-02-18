@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2026/dev/Arch Linux) (preloaded format=pdflatex 2026.2.18)  18 FEB 2026 13:04
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2026/dev/Arch Linux) (preloaded format=pdflatex 2026.2.18)  18 FEB 2026 13:15
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1218,8 +1218,24 @@ LaTeX Warning: `h' float specifier changed to `ht'.
 [6]
 
 
+Underfull \hbox (badness 2564) in paragraph at lines 1268--1271
+[]\T1/lmr/m/n/9 (+20) S. Chen, Z. Wang, S. Arora, et al., ``Pro-gent:
+ []
 
-[7] (./qvm-remote.aux)
+
+Underfull \hbox (badness 2582) in paragraph at lines 1268--1271
+\T1/lmr/m/n/9 (+20) Pro-grammable priv-i-lege con-trol for LLM agents,''
+ []
+
+
+
+[7]
+
+
+
+[8
+
+] (./qvm-remote.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
@@ -1228,11 +1244,11 @@ Package rerunfilecheck Info: File `qvm-remote.out' has not changed.
 (rerunfilecheck)             Checksum: FF8387C6B1735A8E8FB38C57ECEE8976;5267.
  ) 
 Here is how much of TeX's memory you used:
- 31007 strings out of 475171
- 572959 string characters out of 5767095
- 1107044 words of memory out of 5000000
- 52944 multiletter control sequences out of 15000+600000
- 776129 words of font info for 353 fonts, out of 8000000 for 9000
+ 31030 strings out of 475171
+ 573345 string characters out of 5767095
+ 1107360 words of memory out of 5000000
+ 52952 multiletter control sequences out of 15000+600000
+ 776384 words of font info for 356 fonts, out of 8000000 for 9000
  14 hyphenation exceptions out of 8191
  84i,12n,94p,1007b,1342s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/share/texmf-dist/fonts/type1/public/lm/lmbx10.pfb></usr/share/texmf-dis
@@ -1257,10 +1273,10 @@ lic/lm/lmtt10.pfb></usr/share/texmf-dist/fonts/type1/public/lm/lmtt8.pfb></usr/
 share/texmf-dist/fonts/type1/public/lm/lmtt9.pfb></usr/share/texmf-dist/fonts/t
 ype1/public/lm/lmtti10.pfb></usr/share/texmf-dist/fonts/type1/urw/zapfding/uzdr
 .pfb>
-Output written on qvm-remote.pdf (7 pages, 633313 bytes).
+Output written on qvm-remote.pdf (8 pages, 637974 bytes).
 PDF statistics:
- 577 PDF objects out of 1000 (max. 8388607)
- 460 compressed objects within 5 object streams
- 115 named destinations out of 1000 (max. 500000)
+ 600 PDF objects out of 1000 (max. 8388607)
+ 482 compressed objects within 5 object streams
+ 124 named destinations out of 1000 (max. 500000)
  116225 words of extra memory for PDF output out of 128383 (max. 10000000)
 

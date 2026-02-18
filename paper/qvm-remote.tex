@@ -1016,6 +1016,32 @@ and Unix domain sockets~\cite{stevens2003unix} provide local IPC.
 The present protocol extends file-based IPC across the hypervisor
 boundary using the host-initiated qvm-run mechanism as the transport.
 
+\textbf{Agent sandboxing and privilege control (2025).}
+IsolateGPT~\cite{wu2025isolategpt} provides execution isolation for
+LLM-based agentic systems (NDSS~2025).
+Progent~\cite{chen2025progent} introduces programmable privilege
+control using a domain-specific policy language.
+Cohen et al.~\cite{cohen2025faulttolerant} apply transactional
+sandboxing with policy-based interception for AI coding agents,
+achieving 100\% interception of high-risk commands. The present
+framework enables these agent architectures to cross the dom0
+boundary safely.
+
+\textbf{Post-quantum hash-based authentication (2025).}
+Recent work on stateless hash-based
+signatures~\cite{bernstein2025sphincs} and hybrid hash
+frameworks~\cite{nature2025hybridhash} integrating SHA-512 and
+BLAKE3 demonstrates that HMAC-based authentication remains a
+conservative, quantum-resistant foundation. The present system's
+HMAC-SHA256 authentication can be upgraded to post-quantum
+constructions as they mature.
+
+\textbf{Container escape vulnerabilities (2025).}
+Three critical runc CVEs disclosed in November
+2025~\cite{cve2025runc} exploit mount race conditions for full
+container breakout, reinforcing the motivation for hypervisor-level
+isolation over same-kernel approaches.
+
 % ─── 10. Discussion ──────────────────────────────────────────────
 \section{Discussion}
 \label{sec:discussion}
@@ -1031,14 +1057,22 @@ unsuitable for real-time control loops.
 hypervisor correctly enforces memory isolation, (b)~dom0's filesystem
 is not compromised, and (c)~the shared key is not leaked through
 side channels. Assumption (a) is shared with all Qubes
-applications; (b) and (c) are mitigated by file permissions and
-the out-of-band key exchange.
+applications but has been challenged by recent microarchitectural
+attacks (QSB-108,
+XSA-471)~\cite{qubes2025qsb108}---demonstrating the need for
+ongoing mitigation. Assumptions~(b) and~(c) are mitigated by file
+permissions and the out-of-band key exchange.
 
 \textbf{Future work.} Formal verification of the protocol using
 TLA+~\cite{lamport2002specifying} or
 Tamarin~\cite{meier2013tamarin}; integration with hardware security
-modules for key storage; and adaptive polling intervals based on
-queue activity patterns.
+modules for key storage; adaptive polling intervals based on
+queue activity patterns; migration to post-quantum hash
+constructions~\cite{bernstein2025sphincs, nature2025hybridhash}
+as standardized alternatives mature; and integration with
+privilege-control frameworks~\cite{chen2025progent} to compose
+fine-grained application-layer policies with the present
+transport-layer authentication.
 
 % ─── 11. Conclusion ──────────────────────────────────────────────
 \section{Conclusion}
@@ -1223,6 +1257,51 @@ Addison-Wesley, 2002.
 S.~Meier, B.~Schmidt, C.~Cremers, and D.~Basin,
 ``The TAMARIN prover for the symbolic analysis of security protocols,''
 in \textit{Proc.\ CAV}, 2013.
+
+\bibitem{wu2025isolategpt}
+S.~Wu, H.~Duan, Y.~Wang, et al.,
+``IsolateGPT: An execution isolation architecture for LLM-based
+agentic systems,''
+in \textit{Proc.\ NDSS}, 2025.
+
+\bibitem{chen2025progent}
+S.~Chen, Z.~Wang, S.~Arora, et al.,
+``Progent: Programmable privilege control for LLM agents,''
+\textit{arXiv:2504.11703}, 2025.
+
+\bibitem{cohen2025faulttolerant}
+I.~Cohen, A.~Levy, et al.,
+``Fault-tolerant sandboxing for AI coding agents: A transactional
+approach to safe autonomous execution,''
+\textit{arXiv:2512.12806}, 2025.
+
+\bibitem{bernstein2025sphincs}
+D.~Aumasson, D.~Bernstein, et al.,
+``Stateless hash-based signatures for post-quantum security keys,''
+\textit{IACR ePrint}, 2025/298.
+
+\bibitem{nature2025hybridhash}
+A.~Khan, S.~Malik, et al.,
+``A hybrid hash framework for post quantum secure zero knowledge
+identification,''
+\textit{Scientific Reports}, vol.~15, 2025.
+
+\bibitem{cve2025runc}
+MITRE,
+``CVE-2025-31133, CVE-2025-52565, CVE-2025-52881: runc container
+escape via mount race conditions,''
+\textit{NVD}, 2025.
+
+\bibitem{qubes2025qsb108}
+Qubes~OS Project,
+``QSB-108: Transitive Scheduler Attacks (XSA-471),''
+\textit{Qubes Security Bulletin}, July 2025.
+
+\bibitem{ieee2025qubes}
+B.~Singh, R.~Kumar, et al.,
+``Imperative observation of security in Qubes operating system and
+user anonymity in digital epoch,''
+in \textit{Proc.\ IEEE ICCCSP}, 2025.
 
 \end{thebibliography}
 

@@ -1,0 +1,400 @@
+#!/usr/bin/python3
+# qvm-remote-webui -- web log viewer for qvm-remote-dom0
+#
+# Copyright (C) 2026  qvm-remote contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Minimal web UI for viewing qvm-remote-dom0 logs with color coding.
+
+Serves a single-page HTML app that auto-refreshes and applies CSS
+colours matching the terminal ANSI categories.  Designed to run on
+dom0 alongside the daemon; binds to localhost only by default.
+
+Usage:
+    qvm-remote-webui [--port PORT] [--bind ADDR] [--log PATH]
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+VERSION = "1.1.0"
+DEFAULT_PORT = 8890
+DEFAULT_BIND = "127.0.0.1"
+DEFAULT_LOG = "/var/log/qubes/qvm-remote.log"
+MAX_LINES = 2000
+
+# Regex to parse log lines: [timestamp] CATEGORY rest-of-message
+_LINE_RE = re.compile(
+    r"^\[([^\]]+)\]\s+"
+    r"(INFO|EXEC|CMD|AUTH-OK|AUTH-FAIL|AUTH-DENY|REJECT|"
+    r"OUT|ERR|DONE|DONE-FAIL|ERROR|TIMEOUT|TRUNC|DRY)\s+"
+    r"(.*)$"
+)
+
+# ── HTML template ────────────────────────────────────────────────────
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qvm-remote-dom0 logs</title>
+<style>
+  :root {
+    --bg:        #1a1b26;
+    --bg-alt:    #1f2030;
+    --fg:        #c0caf5;
+    --fg-dim:    #565f89;
+    --cyan:      #7dcfff;
+    --green:     #9ece6a;
+    --bgreen:    #73daca;
+    --yellow:    #e0af68;
+    --red:       #f7768e;
+    --bred:      #ff9e64;
+    --magenta:   #bb9af7;
+    --blue:      #7aa2f7;
+    --white-b:   #e4e8f4;
+    --byellow:   #e0af68;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Source Code Pro", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--bg-alt);
+    border-bottom: 1px solid #2a2c3e;
+    padding: 10px 20px;
+    display: flex; align-items: center; gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 {
+    font-size: 15px; font-weight: 600;
+    color: var(--blue);
+    white-space: nowrap;
+  }
+  header .meta {
+    font-size: 11px; color: var(--fg-dim);
+  }
+  header .controls {
+    margin-left: auto;
+    display: flex; gap: 10px; align-items: center;
+  }
+  header label { font-size: 11px; color: var(--fg-dim); cursor: pointer; }
+  header input[type=text] {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid #2a2c3e; border-radius: 4px;
+    padding: 3px 8px; font-size: 11px; width: 180px;
+    font-family: inherit;
+  }
+  header input[type=text]:focus { border-color: var(--blue); outline: none; }
+  .badge {
+    display: inline-block;
+    padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 600;
+    margin-right: 2px;
+  }
+  #log-container {
+    padding: 8px 16px 40px;
+    overflow-x: auto;
+  }
+  .log-line {
+    padding: 1px 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-line:hover { background: var(--bg-alt); }
+  .ts  { color: var(--fg-dim); }
+
+  .cat-INFO      { color: var(--cyan); }
+  .cat-EXEC      { color: var(--white-b); font-weight: bold; }
+  .cat-CMD       { color: var(--yellow); }
+  .cat-AUTH-OK   { color: var(--green); }
+  .cat-AUTH-FAIL { color: var(--red); font-weight: bold; }
+  .cat-AUTH-DENY { color: var(--red); font-weight: bold; }
+  .cat-REJECT    { color: var(--red); }
+  .cat-OUT       { color: var(--bgreen); opacity: 0.8; }
+  .cat-ERR       { color: var(--bred); opacity: 0.85; }
+  .cat-DONE      { color: var(--green); }
+  .cat-DONE-FAIL { color: var(--byellow); }
+  .cat-ERROR     { color: var(--red); font-weight: bold; }
+  .cat-TIMEOUT   { color: var(--red); font-weight: bold; }
+  .cat-TRUNC     { color: var(--magenta); }
+  .cat-DRY       { color: var(--magenta); }
+  .cat-UNKNOWN   { color: var(--fg-dim); }
+
+  .badge-INFO      { background: #7dcfff22; color: var(--cyan); }
+  .badge-EXEC      { background: #e4e8f418; color: var(--white-b); }
+  .badge-CMD       { background: #e0af6822; color: var(--yellow); }
+  .badge-AUTH-OK   { background: #9ece6a22; color: var(--green); }
+  .badge-AUTH-FAIL { background: #f7768e30; color: var(--red); }
+  .badge-AUTH-DENY { background: #f7768e30; color: var(--red); }
+  .badge-REJECT    { background: #f7768e20; color: var(--red); }
+  .badge-OUT       { background: #73daca15; color: var(--bgreen); }
+  .badge-ERR       { background: #ff9e6420; color: var(--bred); }
+  .badge-DONE      { background: #9ece6a22; color: var(--green); }
+  .badge-DONE-FAIL { background: #e0af6822; color: var(--byellow); }
+  .badge-ERROR     { background: #f7768e30; color: var(--red); }
+  .badge-TIMEOUT   { background: #f7768e30; color: var(--red); }
+  .badge-TRUNC     { background: #bb9af720; color: var(--magenta); }
+  .badge-DRY       { background: #bb9af720; color: var(--magenta); }
+  .badge-UNKNOWN   { background: #565f8920; color: var(--fg-dim); }
+
+  .out-group {
+    border-left: 2px solid #73daca30;
+    margin-left: 4px;
+    padding-left: 8px;
+  }
+  .err-group {
+    border-left: 2px solid #ff9e6430;
+    margin-left: 4px;
+    padding-left: 8px;
+  }
+
+  #scroll-btn {
+    position: fixed; bottom: 16px; right: 16px;
+    background: var(--blue); color: #fff;
+    border: none; border-radius: 20px;
+    padding: 6px 14px; font-size: 11px;
+    cursor: pointer; display: none;
+    font-family: inherit;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #scroll-btn:hover { opacity: 0.85; }
+
+  #status {
+    position: fixed; bottom: 16px; left: 16px;
+    font-size: 10px; color: var(--fg-dim);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>qvm-remote-dom0</h1>
+  <span class="meta" id="line-count"></span>
+  <div class="controls">
+    <input type="text" id="filter" placeholder="Filter (regex)…"
+           title="Filter log lines by regex pattern">
+    <label><input type="checkbox" id="auto-scroll" checked> Auto-scroll</label>
+    <label><input type="checkbox" id="auto-refresh" checked> Live</label>
+  </div>
+</header>
+<div id="log-container"></div>
+<button id="scroll-btn" onclick="scrollToBottom()">⬇ Latest</button>
+<div id="status"></div>
+
+<script>
+const LOG_API   = "/api/logs";
+const POLL_MS   = 1500;
+const container = document.getElementById("log-container");
+const filterEl  = document.getElementById("filter");
+const countEl   = document.getElementById("line-count");
+const statusEl  = document.getElementById("status");
+const scrollBtn = document.getElementById("scroll-btn");
+const autoScr   = document.getElementById("auto-scroll");
+const autoRef   = document.getElementById("auto-refresh");
+
+let allLines    = [];
+let lastLen     = 0;
+let filterRe    = null;
+let pollTimer   = null;
+
+const CAT_RE = /^\[([^\]]+)\]\s+(INFO|EXEC|CMD|AUTH-OK|AUTH-FAIL|AUTH-DENY|REJECT|OUT|ERR|DONE|DONE-FAIL|ERROR|TIMEOUT|TRUNC|DRY)\s+(.*)$/;
+
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function renderLine(raw) {
+  const m = raw.match(CAT_RE);
+  if (!m) {
+    return `<div class="log-line cat-UNKNOWN">${escHtml(raw)}</div>`;
+  }
+  const [, ts, cat, msg] = m;
+  const groupCls = cat === "OUT" ? " out-group" : cat === "ERR" ? " err-group" : "";
+  return `<div class="log-line cat-${cat}${groupCls}">`
+    + `<span class="ts">[${escHtml(ts)}]</span> `
+    + `<span class="badge badge-${cat}">${escHtml(cat)}</span> `
+    + `<span class="cat-${cat}">${escHtml(msg)}</span>`
+    + `</div>`;
+}
+
+function applyFilter() {
+  const val = filterEl.value.trim();
+  try {
+    filterRe = val ? new RegExp(val, "i") : null;
+    filterEl.style.borderColor = "";
+  } catch {
+    filterEl.style.borderColor = "#f7768e";
+    return;
+  }
+  redraw();
+}
+
+function redraw() {
+  const visible = filterRe ? allLines.filter(l => filterRe.test(l)) : allLines;
+  container.innerHTML = visible.map(renderLine).join("");
+  countEl.textContent = filterRe
+    ? `${visible.length} / ${allLines.length} lines`
+    : `${allLines.length} lines`;
+  if (autoScr.checked) scrollToBottom();
+}
+
+function scrollToBottom() {
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+}
+
+window.addEventListener("scroll", () => {
+  const atBottom = (window.innerHeight + window.scrollY) >= document.body.scrollHeight - 60;
+  scrollBtn.style.display = atBottom ? "none" : "block";
+});
+
+async function fetchLogs() {
+  try {
+    const resp = await fetch(`${LOG_API}?offset=${lastLen}`);
+    if (!resp.ok) { statusEl.textContent = `Error ${resp.status}`; return; }
+    const data = await resp.json();
+    if (data.lines && data.lines.length > 0) {
+      allLines = allLines.concat(data.lines);
+      lastLen = data.total_bytes;
+      redraw();
+    }
+    statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    statusEl.textContent = `Fetch error: ${e.message}`;
+  }
+}
+
+function startPoll() {
+  stopPoll();
+  pollTimer = setInterval(() => { if (autoRef.checked) fetchLogs(); }, POLL_MS);
+}
+function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+filterEl.addEventListener("input", applyFilter);
+autoRef.addEventListener("change", () => { if (autoRef.checked) startPoll(); else stopPoll(); });
+
+fetchLogs().then(startPoll);
+</script>
+</body>
+</html>"""
+
+
+class LogHandler(BaseHTTPRequestHandler):
+    log_path: str = DEFAULT_LOG
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self._serve_html()
+        elif self.path.startswith("/api/logs"):
+            self._serve_logs()
+        else:
+            self.send_error(404)
+
+    def _serve_html(self):
+        body = HTML_PAGE.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_logs(self):
+        offset = 0
+        if "?" in self.path:
+            qs = self.path.split("?", 1)[1]
+            for pair in qs.split("&"):
+                if pair.startswith("offset="):
+                    try:
+                        offset = int(pair.split("=", 1)[1])
+                    except ValueError:
+                        pass
+
+        lines = []
+        total_bytes = 0
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(0, 2)
+                total_bytes = f.tell()
+                if offset < total_bytes:
+                    f.seek(offset)
+                    chunk = f.read()
+                    text = chunk.decode(errors="replace")
+                    lines = [l for l in text.splitlines() if l.strip()]
+                    # Cap to MAX_LINES on first full load
+                    if offset == 0 and len(lines) > MAX_LINES:
+                        lines = lines[-MAX_LINES:]
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+        payload = json.dumps({
+            "lines": lines,
+            "total_bytes": total_bytes,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def main() -> int:
+    port = DEFAULT_PORT
+    bind = DEFAULT_BIND
+    log_path = DEFAULT_LOG
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(__doc__ or "", end="")
+            print(f"\nDefaults: --bind {DEFAULT_BIND} --port {DEFAULT_PORT} "
+                  f"--log {DEFAULT_LOG}")
+            return 0
+        if a == "--version":
+            print(f"qvm-remote-webui {VERSION}")
+            return 0
+        if a == "--port" and i + 1 < len(args):
+            port = int(args[i + 1]); i += 2; continue
+        if a == "--bind" and i + 1 < len(args):
+            bind = args[i + 1]; i += 2; continue
+        if a == "--log" and i + 1 < len(args):
+            log_path = args[i + 1]; i += 2; continue
+        print(f"qvm-remote-webui: unknown option: {a}", file=sys.stderr)
+        return 1
+
+    LogHandler.log_path = log_path
+
+    server = HTTPServer((bind, port), LogHandler)
+    ts = datetime.now().isoformat(timespec="seconds")
+    print(f"[{ts}] qvm-remote-webui {VERSION} listening on "
+          f"http://{bind}:{port}  (log={log_path})")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    server.server_close()
+    print(f"\n[{datetime.now().isoformat(timespec='seconds')}] Stopped.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
