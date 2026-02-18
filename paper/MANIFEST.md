@@ -80,6 +80,14 @@ make sync     # Copy outputs to ~/Documents/qvm-remote/
     └── post-3.png
 ```
 
+## v1.4 Additions
+
+| File | Description |
+|------|-------------|
+| `webui/qubes-global-admin-web` | Web admin panel: 12 tabs, 38 API endpoints, policy enforcer, dev mode |
+| `dom0/qvm-remote-dom0` | Threaded daemon (8 concurrent), VM running-state cache, 10s poll timeout |
+| `test/test-dom0-e2e.sh` | 55 automated E2E tests covering all APIs and HTML features |
+
 ## Citation
 
 ```bibtex

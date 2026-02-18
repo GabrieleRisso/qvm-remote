@@ -129,6 +129,19 @@ qvm-remote is the bootstrapping mechanism that makes [qubes-claw](https://github
 
 ---
 
+## Web Admin Panel
+
+v1.4 includes a full web admin panel served air-gapped from dom0 (`127.0.0.1:9876`). Pure Python stdlib — no npm, no bundlers, no external assets.
+
+- **12 deep-linkable tabs** — Dashboard, Logs, VMs, Execute, Files, OpenClaw, Device, Global Config, VM Tools, qvm-remote, Backup, Policy Enforcer
+- **Policy enforcer** — restrict which VMs can execute which commands, with a Qubes-style device-attachment UI
+- **Threaded daemon** — concurrent command processing from multiple VMs (up to 8 threads)
+- **Development mode** — temporary elevated permissions with auto-expiry countdown
+- **38 API endpoints** — health, vm-list, execute, browse, journal, suggestions, and more
+- **55 automated E2E tests** — covering all services, APIs, HTML features, and policy enforcement
+
+---
+
 ## The Paper
 
 The repository includes a full academic paper (LaTeX source + compiled PDF) with:
