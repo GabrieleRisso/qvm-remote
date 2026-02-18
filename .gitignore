@@ -27,3 +27,4 @@ keys/*.gpg
 keys/*.key
 *.pyc
 __pycache__/
+__pycache__/

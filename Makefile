@@ -135,13 +135,25 @@ install-web:
 	install -m 0755 webui/qubes-global-admin-web $(DESTDIR)$(BINDIR)/qubes-global-admin-web
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 0644 webui/qubes-global-admin-web.service $(DESTDIR)$(UNITDIR)/qubes-global-admin-web.service
+	install -m 0644 webui/qubes-admin-watchdog.service $(DESTDIR)$(UNITDIR)/qubes-admin-watchdog.service
+	install -m 0644 webui/qubes-admin-watchdog.timer $(DESTDIR)$(UNITDIR)/qubes-admin-watchdog.timer
 	install -d $(DESTDIR)$(DATADIR)/applications
 	install -m 0644 webui/qubes-global-admin-web.desktop $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-web.desktop
+	install -d $(DESTDIR)/usr/local/bin
+	install -m 0755 webui/qubes-admin-genmon.sh $(DESTDIR)/usr/local/bin/qubes-admin-genmon.sh
+	install -m 0755 webui/qubes-admin-autostart.sh $(DESTDIR)/usr/local/bin/qubes-admin-autostart.sh
+	install -d $(DESTDIR)/etc/xdg/autostart
+	install -m 0644 webui/qubes-admin-autostart.desktop $(DESTDIR)/etc/xdg/autostart/qubes-admin-autostart.desktop
 
 uninstall-web:
 	rm -f $(DESTDIR)$(BINDIR)/qubes-global-admin-web
 	rm -f $(DESTDIR)$(UNITDIR)/qubes-global-admin-web.service
+	rm -f $(DESTDIR)$(UNITDIR)/qubes-admin-watchdog.service
+	rm -f $(DESTDIR)$(UNITDIR)/qubes-admin-watchdog.timer
 	rm -f $(DESTDIR)$(DATADIR)/applications/qubes-global-admin-web.desktop
+	rm -f $(DESTDIR)/usr/local/bin/qubes-admin-genmon.sh
+	rm -f $(DESTDIR)/usr/local/bin/qubes-admin-autostart.sh
+	rm -f $(DESTDIR)/etc/xdg/autostart/qubes-admin-autostart.desktop
 
 check:
 	@python3 -c "import py_compile; py_compile.compile('vm/qvm-remote', doraise=True)" && echo "vm/qvm-remote: ok"
@@ -154,7 +166,10 @@ check:
 	@python3 -c "import py_compile; py_compile.compile('gui2/qubes-global-admin-dom0', doraise=True)" && echo "gui2/qubes-global-admin-dom0: ok"
 	@python3 -c "import py_compile; py_compile.compile('webui/qubes-global-admin-web', doraise=True)" && echo "webui/qubes-global-admin-web: ok"
 	@bash -n install/install-dom0.sh && echo "install/install-dom0.sh: ok"
+	@bash -n install/install-client-template.sh && echo "install/install-client-template.sh: ok"
 	@bash -n upgrade-dom0.sh && echo "upgrade-dom0.sh: ok"
+	@bash -n webui/qubes-admin-autostart.sh && echo "webui/qubes-admin-autostart.sh: ok"
+	@bash -n webui/qubes-admin-genmon.sh && echo "webui/qubes-admin-genmon.sh: ok"
 
 test:
 	@python3 test/test_qvm_remote.py -v

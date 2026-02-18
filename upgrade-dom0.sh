@@ -70,19 +70,25 @@ echo "Stopping current daemon..."
 qvm-remote -t 15 'systemctl stop qvm-remote-dom0 2>/dev/null; sleep 1; echo "stopped"' 2>&1 || true
 sleep 2
 
-# 3. Push new files to dom0
+# 3. Push new files to dom0 via tar bundle
 echo ""
-echo "Pushing updated files to dom0..."
+echo "Pushing updated files to dom0 via tar..."
 
-qvm-remote -t 30 "qvm-run --pass-io --no-gui $VM 'cat $REPO/dom0/qvm-remote-dom0' > /tmp/qvm-remote-dom0.new && chmod 755 /tmp/qvm-remote-dom0.new && echo 'daemon pulled'"
-qvm-remote -t 15 "qvm-run --pass-io --no-gui $VM 'cat $REPO/dom0/qvm-remote-dom0.service' > /tmp/qvm-remote-dom0.service.new && echo 'service pulled'"
-qvm-remote -t 10 "qvm-run --pass-io --no-gui $VM 'cat $REPO/version' > /tmp/qvm-remote-version.new && echo 'version pulled'"
-
+TAR_FILES="dom0/qvm-remote-dom0 dom0/qvm-remote-dom0.service version"
 if [ $INSTALL_GUI -eq 1 ]; then
-    qvm-remote -t 30 "qvm-run --pass-io --no-gui $VM 'cat $REPO/gui/qvm-remote-dom0-gui' > /tmp/qvm-remote-dom0-gui.new && chmod 755 /tmp/qvm-remote-dom0-gui.new && echo 'gui pulled'"
-    qvm-remote -t 30 "qvm-run --pass-io --no-gui $VM 'cat $REPO/gui/qubes_remote_ui.py' > /tmp/qubes_remote_ui.py.new && echo 'shared module pulled'"
-    qvm-remote -t 10 "qvm-run --pass-io --no-gui $VM 'cat $REPO/gui/qvm-remote-dom0-gui.desktop' > /tmp/qvm-remote-dom0-gui.desktop.new && echo 'desktop file pulled'"
+    TAR_FILES="$TAR_FILES gui/qvm-remote-dom0-gui gui/qubes_remote_ui.py gui/qvm-remote-dom0-gui.desktop"
 fi
+
+# Also include webui if present
+if [ -f "$REPO/webui/qubes-global-admin-web" ]; then
+    TAR_FILES="$TAR_FILES webui/qubes-global-admin-web webui/qubes-global-admin-web.service webui/qubes-global-admin-web.desktop"
+fi
+
+qvm-remote -t 60 "qvm-run --pass-io --no-gui $VM 'tar czf - -C $REPO $TAR_FILES' | tar xzf - -C /tmp/qvm-remote-upgrade/ && echo 'tar bundle received'"
+
+SRC_SIZE=$(qvm-remote -t 10 "qvm-run --pass-io --no-gui $VM 'tar czf - -C $REPO $TAR_FILES | wc -c'")
+DST_SIZE=$(qvm-remote -t 10 "tar czf - -C /tmp/qvm-remote-upgrade $TAR_FILES 2>/dev/null | wc -c")
+echo "  Transfer integrity: src=${SRC_SIZE:-?} dst=${DST_SIZE:-?} bytes"
 
 # 4. Install files in dom0
 echo ""
@@ -91,47 +97,65 @@ echo "Installing in dom0..."
 INSTALL_GUI_FLAG=$INSTALL_GUI
 cat << INSTALL_SCRIPT | qvm-remote -t 30
 set -e
+UP=/tmp/qvm-remote-upgrade
 
 if [ -f /usr/bin/qvm-remote-dom0 ]; then
     cp /usr/bin/qvm-remote-dom0 /usr/bin/qvm-remote-dom0.bak
     echo "  backed up current daemon"
 fi
 
-cp /tmp/qvm-remote-dom0.new /usr/bin/qvm-remote-dom0
+cp \$UP/dom0/qvm-remote-dom0 /usr/bin/qvm-remote-dom0
 chmod 755 /usr/bin/qvm-remote-dom0
 echo "  installed daemon"
 
-cp /tmp/qvm-remote-dom0.service.new /etc/systemd/system/qvm-remote-dom0.service
+cp \$UP/dom0/qvm-remote-dom0.service /etc/systemd/system/qvm-remote-dom0.service
 chmod 644 /etc/systemd/system/qvm-remote-dom0.service
 systemctl daemon-reload
 echo "  installed service file"
 
+mkdir -p /usr/lib/qvm-remote
+cp \$UP/version /usr/lib/qvm-remote/version
+echo "  installed version"
+
 if [ $INSTALL_GUI_FLAG -eq 1 ]; then
-    cp /tmp/qvm-remote-dom0-gui.new /usr/bin/qvm-remote-dom0-gui
+    cp \$UP/gui/qvm-remote-dom0-gui /usr/bin/qvm-remote-dom0-gui
     chmod 755 /usr/bin/qvm-remote-dom0-gui
     echo "  installed GUI"
 
-    mkdir -p /usr/lib/qvm-remote
-    cp /tmp/qubes_remote_ui.py.new /usr/lib/qvm-remote/qubes_remote_ui.py
+    cp \$UP/gui/qubes_remote_ui.py /usr/lib/qvm-remote/qubes_remote_ui.py
     chmod 644 /usr/lib/qvm-remote/qubes_remote_ui.py
     echo "  installed shared module"
 
-    cp /tmp/qvm-remote-version.new /usr/lib/qvm-remote/version
-    echo "  installed version"
-
     mkdir -p /usr/share/applications
-    cp /tmp/qvm-remote-dom0-gui.desktop.new /usr/share/applications/qvm-remote-dom0-gui.desktop
+    cp \$UP/gui/qvm-remote-dom0-gui.desktop /usr/share/applications/qvm-remote-dom0-gui.desktop
     chmod 644 /usr/share/applications/qvm-remote-dom0-gui.desktop
     echo "  installed desktop file"
+fi
+
+# Install web UI if present
+if [ -f \$UP/webui/qubes-global-admin-web ]; then
+    cp \$UP/webui/qubes-global-admin-web /usr/bin/qubes-global-admin-web
+    chmod 755 /usr/bin/qubes-global-admin-web
+    echo "  installed web UI"
+    if [ -f \$UP/webui/qubes-global-admin-web.service ]; then
+        cp \$UP/webui/qubes-global-admin-web.service /etc/systemd/system/qubes-global-admin-web.service
+        chmod 644 /etc/systemd/system/qubes-global-admin-web.service
+        systemctl daemon-reload
+        echo "  installed web UI service"
+    fi
+    if [ -f \$UP/webui/qubes-global-admin-web.desktop ]; then
+        mkdir -p /usr/share/applications
+        cp \$UP/webui/qubes-global-admin-web.desktop /usr/share/applications/qubes-global-admin-web.desktop
+        chmod 644 /usr/share/applications/qubes-global-admin-web.desktop
+        echo "  installed web UI desktop file"
+    fi
 fi
 
 echo ""
 echo "Verifying..."
 /usr/bin/qvm-remote-dom0 --version
 
-rm -f /tmp/qvm-remote-dom0.new /tmp/qvm-remote-dom0.service.new \
-      /tmp/qvm-remote-version.new /tmp/qvm-remote-dom0-gui.new \
-      /tmp/qubes_remote_ui.py.new /tmp/qvm-remote-dom0-gui.desktop.new
+rm -rf /tmp/qvm-remote-upgrade
 
 echo ""
 echo "=== Files installed ==="

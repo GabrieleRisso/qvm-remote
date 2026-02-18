@@ -1,15 +1,22 @@
 [Unit]
-Description=Qubes Global Admin Web (localhost)
-After=network.target
+Description=Qubes Global Admin Web (localhost:9876)
+After=network.target qubesd.service
 Documentation=man:qvm-remote(1)
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p /var/run/qvm-remote
+ExecStartPre=/bin/chmod 0700 /var/run/qvm-remote
 ExecStart=/usr/bin/qubes-global-admin-web
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 User=root
 Environment=QUBES_ADMIN_PORT=9876
+TimeoutStartSec=10
+TimeoutStopSec=10
+WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target

@@ -1,15 +1,21 @@
 [Unit]
 Description=qvm-remote-dom0 — VM-to-dom0 command bridge
 After=qubesd.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
+ExecStartPre=/bin/mkdir -p /var/run/qvm-remote
+ExecStartPre=/bin/chmod 0700 /var/run/qvm-remote
 ExecStart=/usr/bin/qvm-remote-dom0
 EnvironmentFile=-/etc/qubes/remote.conf
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
+TimeoutStartSec=10
+TimeoutStopSec=10
 
 [Install]
 # Not enabled by default.  Use: qvm-remote-dom0 enable

@@ -78,8 +78,8 @@ if string.find(title, "VM Selector") then
     place(0, W/2-250, UH/2-250, 500, 500); return
 end
 
--- dom0 - Thunar (cyberdeck home)
-if string.find(title, "cyberdeck %- Thunar") then
+-- dom0 - Thunar (local home folder) -- matches "<user> - Thunar"
+if string.find(title, "Thunar") and not string.find(title, "%]") then
     botright(0); return
 end
 
@@ -102,8 +102,8 @@ if string.find(title, "Lain") then
     right13(1); return
 end
 
--- VM Thunar (not cyberdeck's) in code workspace
-if string.find(title, "Thunar") and not string.find(title, "cyberdeck") then
+-- VM Thunar (prefixed with [vmname]) in code workspace
+if string.find(title, "Thunar") and string.find(title, "%]") then
     right13(1); return
 end
 
